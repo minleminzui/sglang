@@ -1205,7 +1205,6 @@ class Scheduler(
 
         # Set reasoning parameters for the batch if reasoning parser is enabled
         if ret is not None and self.reasoning_parser and ret.sampling_info is not None:
-            ret.sampling_info.think_end_id = self.think_end_id
             ret.sampling_info.disable_grammar_in_reasoning = True
 
         return ret
@@ -1469,7 +1468,7 @@ class Scheduler(
 
         # Update the reasoning section status if reasoning parser is enabled
         if (batch.forward_mode.is_decode() or batch.forward_mode.is_extend()) and isinstance(result, GenerationBatchResult):
-            if self.server_args.reasoning_parser and batch.sampling_info is not None and batch.sampling_info.is_in_reasoning is not None:
+            if self.reasoning_parser and batch.sampling_info is not None and batch.sampling_info.is_in_reasoning is not None:
                 for i, token_id in enumerate(result.next_token_ids):
                     # If the token is think_end_id, set is_in_reasoning to False
                     if token_id == self.think_end_id:
