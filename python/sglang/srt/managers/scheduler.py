@@ -787,7 +787,6 @@ class Scheduler(SchedulerOutputProcessorMixin):
             if not req.grammar:
                 req.grammar = self.grammar_backend.get_future_value(key)
                 add_to_grammar_queue = True
-            
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
