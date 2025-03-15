@@ -115,8 +115,9 @@ class SchedulerOutputProcessorMixin:
                         )
 
                     if req.grammar is not None:
-                        req.grammar.accept_token(next_token_id)
-                        req.grammar.finished = req.finished()
+                        if not batch.sampling_info.is_in_reasoning[i]:
+                            req.grammar.accept_token(next_token_id)
+                            req.grammar.finished = req.finished()
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
@@ -251,8 +252,9 @@ class SchedulerOutputProcessorMixin:
                 )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
-                req.grammar.accept_token(next_token_id)
-                req.grammar.finished = req.finished()
+                if not batch.sampling_info.is_in_reasoning[i]:
+                    req.grammar.accept_token(next_token_id)
+                    req.grammar.finished = req.finished()
 
         if batch.next_batch_sampling_info:
             batch.next_batch_sampling_info.update_regex_vocab_mask()
