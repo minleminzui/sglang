@@ -233,17 +233,14 @@ class Scheduler(
         # Init tokenizer
         self.init_tokenizer()
 
-
-        self.reasoning_parser = None
-        self.think_end_id = None
-        
+        self.think_end_id = None        
         # Set reasoning_parser and think_end_id if tokenizer is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
-            self.reasoning_parser = ReasoningParser(
+            reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
             self.think_end_id = self.tokenizer.encode(
-                self.reasoning_parser.detector.think_end_token, add_special_tokens=False
+                reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
 
         # Check whether overlap can be enabled
@@ -1204,7 +1201,7 @@ class Scheduler(
             ret, _ = self.prepare_dp_attn_batch(ret)
 
         # Set reasoning parameters for the batch if reasoning parser is enabled
-        if ret is not None and self.reasoning_parser and ret.sampling_info is not None:
+        if ret is not None and self.server_args.reasoning_parser and ret.sampling_info is not None:
             ret.sampling_info.disable_grammar_in_reasoning = True
 
         return ret
@@ -1468,11 +1465,11 @@ class Scheduler(
 
         # Update the reasoning section status if reasoning parser is enabled
         if (batch.forward_mode.is_decode() or batch.forward_mode.is_extend()) and isinstance(result, GenerationBatchResult):
-            if self.reasoning_parser and batch.sampling_info is not None and batch.sampling_info.is_in_reasoning is not None:
+            if self.server_args.reasoning_parser and batch.sampling_info is not None and batch.sampling_info.is_in_reasoning is not None:
                 for i, token_id in enumerate(result.next_token_ids):
                     # If the token is think_end_id, set is_in_reasoning to False
                     if token_id == self.think_end_id:
-                        batch.sampling_info.is_in_reasoning[i] = False
+                        batch.sampling_info.grammars[i].fill_vocab_mask(self.vocab_mask, i)
 
         if self.return_health_check_ct:
             # Return some signal for the health check.
