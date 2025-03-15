@@ -56,7 +56,6 @@ class SamplingBatchInfo:
     # Reasoning section parameters
     disable_grammar_in_reasoning: bool = False
     is_in_reasoning: Optional[List[bool]] = None
-    think_end_id: Optional[int] = None
 
     # Device
     device: str = "cuda"
