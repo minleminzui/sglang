@@ -1204,7 +1204,7 @@ class Scheduler(
             ret, _ = self.prepare_dp_attn_batch(ret)
 
         # Set reasoning parameters for the batch if reasoning parser is enabled
-        if ret is not None and self.server_args.reasoning_parser and ret.sampling_info is not None:
+        if ret is not None and self.reasoning_parser and ret.sampling_info is not None:
             ret.sampling_info.think_end_id = self.think_end_id
             ret.sampling_info.disable_grammar_in_reasoning = True
 
