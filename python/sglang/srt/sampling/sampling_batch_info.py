@@ -53,6 +53,11 @@ class SamplingBatchInfo:
         Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]
     ] = None
 
+    # Reasoning section parameters
+    disable_grammar_in_reasoning: bool = False
+    is_in_reasoning: Optional[List[bool]] = None
+    think_end_id: Optional[int] = None
+
     # Device
     device: str = "cuda"
 
@@ -173,6 +178,10 @@ class SamplingBatchInfo:
 
         # Move the mask to the device if needed
         self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
+        
+        # Initialize is_in_reasoning to all True if reasoning is enabled
+        if self.disable_grammar_in_reasoning:
+            self.is_in_reasoning = [True for _ in self.grammars]
 
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:
@@ -194,8 +203,19 @@ class SamplingBatchInfo:
             # Used in the non-overlap mode
             self.penalizer_orchestrator.apply(logits)
 
+        # Apply grammar mask if not in reasoning section or disable_grammar_in_reasoning is False
         if self.vocab_mask is not None:
-            self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
+            if self.disable_grammar_in_reasoning and self.is_in_reasoning is not None:
+                # Create a modified mask that doesn't restrict tokens in reasoning sections
+                modified_mask = self.vocab_mask.clone()
+                for i, is_reasoning in enumerate(self.is_in_reasoning):
+                    if is_reasoning:
+                        # Fill with 1 to allow all tokens in reasoning section
+                        modified_mask[i].fill_(1)
+                self.apply_mask_func(logits=logits, vocab_mask=modified_mask)
+            else:
+                # Apply normal mask
+                self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)

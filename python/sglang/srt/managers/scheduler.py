@@ -112,7 +112,8 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -231,6 +232,19 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
+
+
+        self.reasoning_parser = None
+        self.think_end_id = None
+        
+        # Set reasoning_parser and think_end_id if tokenizer is enabled
+        if self.reasoning_parser and self.tokenizer:
+            self.reasoning_parser = ReasoningParser(
+                model_type=server_args.reasoning_parser, stream_reasoning=False
+            )
+            self.think_end_id = self.tokenizer.encode(
+                self.reasoning_parser.detector.think_end_token, add_special_tokens=False
+            )[0]
 
         # Check whether overlap can be enabled
         if not self.is_generation:
@@ -1189,6 +1203,11 @@ class Scheduler(
         if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
             ret, _ = self.prepare_dp_attn_batch(ret)
 
+        # Set reasoning parameters for the batch if reasoning parser is enabled
+        if ret is not None and self.server_args.reasoning_parser and ret.sampling_info is not None:
+            ret.sampling_info.think_end_id = self.think_end_id
+            ret.sampling_info.disable_grammar_in_reasoning = True
+
         return ret
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
@@ -1447,6 +1466,14 @@ class Scheduler(
             batch.next_batch_sampling_info.update_regex_vocab_mask()
             self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
+
+        # Update the reasoning section status if reasoning parser is enabled
+        if (batch.forward_mode.is_decode() or batch.forward_mode.is_extend()) and isinstance(result, GenerationBatchResult):
+            if self.server_args.reasoning_parser and batch.sampling_info is not None and batch.sampling_info.is_in_reasoning is not None:
+                for i, token_id in enumerate(result.next_token_ids):
+                    # If the token is think_end_id, set is_in_reasoning to False
+                    if token_id == self.think_end_id:
+                        batch.sampling_info.is_in_reasoning[i] = False
 
         if self.return_health_check_ct:
             # Return some signal for the health check.
