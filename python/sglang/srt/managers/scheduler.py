@@ -1449,12 +1449,9 @@ class Scheduler(
             )
 
         # Update the reasoning section status if reasoning parser is enabled
-        # logger.info(f"!!!run_batch_Outer, {batch.reqs=}")
         if (batch.forward_mode.is_decode() or batch.forward_mode.is_extend()) and isinstance(ret, GenerationBatchResult) and self.server_args.reasoning_parser and batch.sampling_info.grammars is not None:
                 assert len(batch.reqs) == len(batch.sampling_info.grammars)
                 for i, token_id in enumerate(ret.next_token_ids):
-                    # If the token is think_end_id, set is_in_reasoning to False
-                    # logger.info(f"!!!\t {batch.reqs[i]=}, {self.think_end_id=}, {batch.sampling_info.grammars=}, {batch.reqs[i].grammar=}")
                     if token_id == self.think_end_id and batch.reqs[i].is_in_reasoning is not None:
                         batch.reqs[i].is_in_reasoning = False
                         batch.sampling_info.grammars[i].fill_vocab_mask(batch.sampling_info.vocab_mask, i)
