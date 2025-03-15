@@ -238,9 +238,9 @@ class Scheduler(
         self.think_end_id = None
         
         # Set reasoning_parser and think_end_id if tokenizer is enabled
-        if self.reasoning_parser and self.tokenizer:
+        if self.server_args.reasoning_parser and self.tokenizer:
             self.reasoning_parser = ReasoningParser(
-                model_type=server_args.reasoning_parser, stream_reasoning=False
+                model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
             self.think_end_id = self.tokenizer.encode(
                 self.reasoning_parser.detector.think_end_token, add_special_tokens=False
