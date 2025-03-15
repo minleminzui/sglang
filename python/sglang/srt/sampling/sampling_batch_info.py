@@ -177,7 +177,6 @@ class SamplingBatchInfo:
 
         # Move the mask to the device if needed
         self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
-        
 
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:
