@@ -113,7 +113,7 @@ class SchedulerOutputProcessorMixin:
                             .clone()
                             .tolist()
                         )
-                    print(f"process_batch_result_prefill, {req}, {req.is_in_reasoning}")
+
                     if req.grammar is not None and not req.is_in_reasoning:
                         req.grammar.accept_token(next_token_id)
                         req.grammar.finished = req.finished()
