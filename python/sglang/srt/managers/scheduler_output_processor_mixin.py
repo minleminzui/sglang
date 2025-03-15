@@ -114,8 +114,7 @@ class SchedulerOutputProcessorMixin:
                             .tolist()
                         )
 
-                    if req.grammar is not None:
-                        if not batch.sampling_info.is_in_reasoning[i]:
+                    if req.grammar is not None and not req.is_in_reasoning:
                             req.grammar.accept_token(next_token_id)
                             req.grammar.finished = req.finished()
                 else:
@@ -251,8 +250,7 @@ class SchedulerOutputProcessorMixin:
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
 
-            if req.grammar is not None and batch.spec_algorithm.is_none():
-                if not batch.sampling_info.is_in_reasoning[i]:
+            if req.grammar is not None and batch.spec_algorithm.is_none() and not req.is_in_reasoning:
                     req.grammar.accept_token(next_token_id)
                     req.grammar.finished = req.finished()
 
