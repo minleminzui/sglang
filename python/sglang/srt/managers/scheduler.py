@@ -941,6 +941,8 @@ class Scheduler(
             if not req.grammar:
                 req.grammar = self.grammar_backend.get_future_value(key)
                 add_to_grammar_queue = True
+                if self.server_args.reasoning_parser:
+                    req.is_in_reasoning = True
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
@@ -1465,11 +1467,12 @@ class Scheduler(
 
         # Update the reasoning section status if reasoning parser is enabled
         if (batch.forward_mode.is_decode() or batch.forward_mode.is_extend()) and isinstance(result, GenerationBatchResult):
-            if self.server_args.reasoning_parser and batch.sampling_info is not None and batch.sampling_info.is_in_reasoning is not None:
+            if self.server_args.reasoning_parser:
                 for i, token_id in enumerate(result.next_token_ids):
                     # If the token is think_end_id, set is_in_reasoning to False
                     if token_id == self.think_end_id:
-                        batch.sampling_info.grammars[i].fill_vocab_mask(self.vocab_mask, i)
+                        batch.reqs[i].is_in_reasoning = False
+                        batch.sampling_info.grammars[i].fill_vocab_mask(batch.sampling_info.vocab_mask, i)
 
         if self.return_health_check_ct:
             # Return some signal for the health check.

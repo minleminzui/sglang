@@ -55,7 +55,6 @@ class SamplingBatchInfo:
 
     # Reasoning section parameters
     disable_grammar_in_reasoning: bool = False
-    is_in_reasoning: Optional[List[bool]] = None
 
     # Device
     device: str = "cuda"
@@ -170,14 +169,11 @@ class SamplingBatchInfo:
             first_grammar.apply_vocab_mask
         )  # force to use static method
 
-        # Initialize is_in_reasoning to all True if reasoning is enabled
-        if self.disable_grammar_in_reasoning:
-            self.is_in_reasoning = [True for _ in self.grammars]
-
         # Apply the mask
-        for i, grammar in enumerate(self.grammars):
-            if grammar and not grammar.finished and not self.is_in_reasoning[i]:
-                grammar.fill_vocab_mask(self.vocab_mask, i)
+        if not self.disable_grammar_in_reasoning:
+            for i, grammar in enumerate(self.grammars):
+                if grammar and not grammar.finished:
+                    grammar.fill_vocab_mask(self.vocab_mask, i)
 
         # Move the mask to the device if needed
         self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
