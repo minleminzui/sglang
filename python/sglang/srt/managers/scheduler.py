@@ -1416,7 +1416,7 @@ class Scheduler(
                 self.spec_num_total_forward_ct += batch.batch_size()
                 self.num_generated_tokens += num_accepted_tokens
             batch.output_ids = next_token_ids
-
+            
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
@@ -1442,6 +1442,15 @@ class Scheduler(
             ret = EmbeddingBatchResult(
                 embeddings=embeddings, bid=model_worker_batch.bid
             )
+
+        # Update the reasoning section status if reasoning parser is enabled
+        if (batch.forward_mode.is_decode() or batch.forward_mode.is_extend()) and isinstance(ret, GenerationBatchResult):
+            if self.server_args.reasoning_parser:
+                for i, token_id in enumerate(ret.next_token_ids):
+                    # If the token is think_end_id, set is_in_reasoning to False
+                    if token_id == self.think_end_id:
+                        batch.reqs[i].is_in_reasoning = False
+                        batch.sampling_info.grammars[i].fill_vocab_mask(batch.sampling_info.vocab_mask, i)
         return ret
 
     def process_batch_result(
@@ -1465,14 +1474,6 @@ class Scheduler(
             self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
-        # Update the reasoning section status if reasoning parser is enabled
-        if (batch.forward_mode.is_decode() or batch.forward_mode.is_extend()) and isinstance(result, GenerationBatchResult):
-            if self.server_args.reasoning_parser:
-                for i, token_id in enumerate(result.next_token_ids):
-                    # If the token is think_end_id, set is_in_reasoning to False
-                    if token_id == self.think_end_id:
-                        batch.reqs[i].is_in_reasoning = False
-                        batch.sampling_info.grammars[i].fill_vocab_mask(batch.sampling_info.vocab_mask, i)
 
         if self.return_health_check_ct:
             # Return some signal for the health check.
