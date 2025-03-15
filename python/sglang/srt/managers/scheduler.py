@@ -840,6 +840,9 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            if self.server_args.reasoning_parser:
+                req.is_in_reasoning = True
+
             if (
                 recv_req.session_params is not None
                 and recv_req.session_params.id is not None
@@ -853,6 +856,10 @@ class Scheduler(
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
+
+            if self.server_args.reasoning_parser:
+                req.is_in_reasoning = True
+
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self._add_request_to_queue(req)
                 return
@@ -941,8 +948,7 @@ class Scheduler(
             if not req.grammar:
                 req.grammar = self.grammar_backend.get_future_value(key)
                 add_to_grammar_queue = True
-                if self.server_args.reasoning_parser:
-                    req.is_in_reasoning = True
+            
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
@@ -1444,11 +1450,13 @@ class Scheduler(
             )
 
         # Update the reasoning section status if reasoning parser is enabled
-        if (batch.forward_mode.is_decode() or batch.forward_mode.is_extend()) and isinstance(ret, GenerationBatchResult):
-            if self.server_args.reasoning_parser:
+        # logger.info(f"!!!run_batch_Outer, {batch.reqs=}")
+        if (batch.forward_mode.is_decode() or batch.forward_mode.is_extend()) and isinstance(ret, GenerationBatchResult) and self.server_args.reasoning_parser and batch.sampling_info.grammars is not None:
+                assert len(batch.reqs) == len(batch.sampling_info.grammars)
                 for i, token_id in enumerate(ret.next_token_ids):
                     # If the token is think_end_id, set is_in_reasoning to False
-                    if token_id == self.think_end_id:
+                    # logger.info(f"!!!\t {batch.reqs[i]=}, {self.think_end_id=}, {batch.sampling_info.grammars=}, {batch.reqs[i].grammar=}")
+                    if token_id == self.think_end_id and batch.reqs[i].is_in_reasoning is not None:
                         batch.reqs[i].is_in_reasoning = False
                         batch.sampling_info.grammars[i].fill_vocab_mask(batch.sampling_info.vocab_mask, i)
         return ret
@@ -1473,7 +1481,6 @@ class Scheduler(
             batch.next_batch_sampling_info.update_regex_vocab_mask()
             self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
-
 
         if self.return_health_check_ct:
             # Return some signal for the health check.
