@@ -21,7 +21,7 @@ import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
-
+import copy
 import torch
 import torch.distributed as dist
 
@@ -1027,8 +1027,9 @@ class ModelRunner:
                 axis=-1,
             )
 
+        
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
-
+        
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,

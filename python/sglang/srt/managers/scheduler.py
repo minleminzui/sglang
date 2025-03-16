@@ -232,14 +232,13 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
-
-        self.think_end_id = None        
+        
         # Set reasoning_parser and think_end_id if tokenizer is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
-            self.think_end_id = self.tokenizer.encode(
+            self.tokenizer.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
 
@@ -1407,6 +1406,7 @@ class Scheduler(
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
+                logger.info(f"333run_batch received: {id(next_token_ids)=}, {next_token_ids=}")
                 bid = model_worker_batch.bid
             else:
                 (
@@ -1447,14 +1447,6 @@ class Scheduler(
             ret = EmbeddingBatchResult(
                 embeddings=embeddings, bid=model_worker_batch.bid
             )
-
-        # Update the reasoning section status if reasoning parser is enabled
-        if (batch.forward_mode.is_decode() or batch.forward_mode.is_extend()) and isinstance(ret, GenerationBatchResult) and self.server_args.reasoning_parser and batch.sampling_info.grammars is not None:
-                assert len(batch.reqs) == len(batch.sampling_info.grammars)
-                for i, token_id in enumerate(ret.next_token_ids):
-                    if token_id == self.think_end_id and batch.reqs[i].is_in_reasoning is not None:
-                        batch.reqs[i].is_in_reasoning = False
-                        batch.sampling_info.grammars[i].fill_vocab_mask(batch.sampling_info.vocab_mask, i)
         return ret
 
     def process_batch_result(
