@@ -167,7 +167,6 @@ class Sampler(nn.Module):
                 op=dist.ReduceOp.MIN,
                 group=self.tp_sync_group,
             )
-
         return batch_next_token_ids.to(torch.int32)
 
     def _apply_custom_logit_processor(
