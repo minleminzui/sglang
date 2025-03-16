@@ -71,6 +71,12 @@ class SchedulerOutputProcessorMixin:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
                     continue
 
+                if req.tokenizer.think_end_id and hasattr(req, 'is_in_reasoning'):
+                    if next_token_id == req.tokenizer.think_end_id:
+                        req.is_in_reasoning = False
+                        if batch.sampling_info and batch.sampling_info.grammars:
+                                batch.sampling_info.grammars[i].fill_vocab_mask(batch.sampling_info.vocab_mask, i)
+
                 if req.is_chunked <= 0:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
@@ -113,7 +119,7 @@ class SchedulerOutputProcessorMixin:
                             .clone()
                             .tolist()
                         )
-
+                    print(f"req: {req}, req.is_in_reasoning: {req.is_in_reasoning=}")
                     if req.grammar is not None and not req.is_in_reasoning:
                         req.grammar.accept_token(next_token_id)
                         req.grammar.finished = req.finished()
@@ -221,6 +227,12 @@ class SchedulerOutputProcessorMixin:
             if batch.spec_algorithm.is_none():
                 # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
+
+            if req.tokenizer.think_end_id and hasattr(req, 'is_in_reasoning'):
+                if next_token_id == req.tokenizer.think_end_id:
+                    req.is_in_reasoning = False
+                    if batch.sampling_info and batch.sampling_info.grammars:
+                            batch.sampling_info.grammars[i].fill_vocab_mask(batch.sampling_info.vocab_mask, i)
 
             req.check_finished()
             if req.finished():
