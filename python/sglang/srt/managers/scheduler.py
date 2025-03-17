@@ -102,6 +102,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
+    DynamicGradMode,
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
@@ -497,7 +498,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 },
             )
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
@@ -517,7 +518,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
             self.last_batch = batch
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue = deque()
@@ -912,7 +913,6 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 f"#token: {num_used}, "
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                 f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"largest-len: {self._largest_prefill_decode_len}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
             )
             spec_accept_length = 0
@@ -930,7 +930,6 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                 f"accept len: {spec_accept_length:.2f}, "
                 f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"largest-len: {self._largest_prefill_decode_len}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
             )
 
