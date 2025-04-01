@@ -180,9 +180,13 @@ class TpModelWorker:
             next_token_ids = None
         else:
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
-        logger.info(f"222forward_batch_generation: {id(next_token_ids)=}, {next_token_ids=}")
+        logger.info(
+            f"222forward_batch_generation: {id(next_token_ids)=}, {next_token_ids=}"
+        )
         result = next_token_ids.to(torch.int32)
-        logger.info(f"222forward_batch_generation after conversion: {id(result)=}, {result=}")
+        logger.info(
+            f"222forward_batch_generation after conversion: {id(result)=}, {result=}"
+        )
         return logits_output, next_token_ids.to(torch.int32)
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):

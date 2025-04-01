@@ -232,7 +232,7 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
-        
+
         # Set reasoning_parser and think_end_id if tokenizer is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
@@ -1207,7 +1207,11 @@ class Scheduler(
             ret, _ = self.prepare_dp_attn_batch(ret)
 
         # Set reasoning parameters for the batch if reasoning parser is enabled
-        if ret is not None and self.server_args.reasoning_parser and ret.sampling_info is not None:
+        if (
+            ret is not None
+            and self.server_args.reasoning_parser
+            and ret.sampling_info is not None
+        ):
             ret.sampling_info.disable_grammar_in_reasoning = True
 
         return ret
@@ -1406,7 +1410,9 @@ class Scheduler(
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
-                logger.info(f"333run_batch received: {id(next_token_ids)=}, {next_token_ids=}")
+                logger.info(
+                    f"333run_batch received: {id(next_token_ids)=}, {next_token_ids=}"
+                )
                 bid = model_worker_batch.bid
             else:
                 (
