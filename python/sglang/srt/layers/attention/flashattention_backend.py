@@ -22,6 +22,28 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+#
+# === InfLLM-v2 稀疏路径依赖（轻耦合）===
+try:
+    # 你们将来提供的 Stage-1/2 Python 包装符号；若未编译，将抛 ImportError
+    from sgl_kernel.infllmv2_ops import (
+        infllm2_stage1_select_blocks,  # Stage-1：返回 TopK 块索引
+    )
+    from sgl_kernel.infllmv2_ops import (
+        infllm2_stage2_sparse_attention,  # Stage-2：执行稀疏注意力（FA3 varlen/sparse 适配）
+    )
+except Exception:
+    infllm2_stage1_select_blocks = None
+    infllm2_stage2_sparse_attention = None
+
+# 稀疏路径的 sidecar / 轻页表 与区间融合
+from sglang.srt.mem_cache.infllmv2_context import (
+    ContextMemoryManager,
+    KVViewsConfig,
+    ensure_c1c2_for_sample,
+)
+from sglang.srt.sparse_utils.range_mapping import blocks_to_token_ranges
+
 
 @dataclass
 class FlashAttentionMetadata:
@@ -360,6 +382,18 @@ class FlashAttentionBackend(AttentionBackend):
         # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
         self.num_splits = (
             1 if model_runner.server_args.enable_deterministic_inference else 0
+
+        # === InfLLM-v2 开关 & 运行参数（不存在也不报错，默认 False）===
+        srv = getattr(model_runner, "server_args", None)
+        self.enable_infllmv2 = bool(getattr(srv, "enable_infllmv2", False))
+        # Stage-1 的 TopK（按块），Sink/Sliding Window 长度（token 粒度）
+        self.infllm2_topk_blocks = int(getattr(srv, "infllmv2_topk_blocks", 4))
+        self.infllm2_sink_tokens = int(getattr(srv, "infllmv2_sink_tokens", 64))
+        self.infllm2_sw_span = int(getattr(srv, "infllmv2_sw_span", 256))
+        # C1/C2 结构（只影响 sidecar 池化尺寸；和硬件、kernel 解耦）
+        self.infllm2_cfg = KVViewsConfig(block_size=64)  # 与 Stage-2 的块定义保持一致
+        self.infllm2_ctx_mgr = ContextMemoryManager(
+            self.infllm2_cfg, device=self.device, dtype=self.kv_cache_dtype
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -646,6 +680,243 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
+    # ===== InfLLM-v2 helpers =====
+    def _should_use_infllm2(self, layer, use_local_attn: bool, forward_batch) -> bool:
+        """满足：开关打开、非 cross-attn、非 local-attn、无 topk>1 级联（先回退）"""
+        if not self.enable_infllmv2:
+            return False
+        if layer.is_cross_attention:
+            return False
+        if use_local_attn:
+            return False
+        # Spec-Decode 的 topk>1 先回退 dense（你们后面也可做稀疏 cascade）
+        if forward_batch.spec_info is not None and (self.topk or 0) > 1:
+            return False
+        # kernel 未就绪则回退
+        if (
+            infllm2_stage1_select_blocks is None
+            or infllm2_stage2_sparse_attention is None
+        ):
+            return False
+        return True
+
+    def _build_token_indices_for_sample(
+        self, seq_len: int, page_table_row: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        根据 page_table（一行）拼出该样本的“逐 token”线性下标：
+        K_pool_pages 视作 [num_pages, page_size, Hk, D]；展平到 [num_pages*page_size, Hk, D] 后，
+        token 下标 = page_id * page_size + offset_in_page
+        """
+        ps = int(self.page_size or 1)
+        num_full = seq_len // ps
+        last = seq_len - num_full * ps
+        pages = page_table_row[: (num_full + (1 if last else 0))].to(torch.int64)
+        base = pages * ps
+        # 逐页展开 offset
+        full = torch.arange(ps, device=pages.device, dtype=torch.int64)[None, :].expand(
+            num_full, -1
+        )
+        idx_full = (base[:num_full, None] + full).reshape(-1)
+        if last:
+            tail = torch.arange(last, device=pages.device, dtype=torch.int64)
+            idx_tail = base[num_full] + tail
+            return torch.cat([idx_full, idx_tail], dim=0).to(torch.int32)
+        return idx_full.to(torch.int32)
+
+    @torch.no_grad()
+    def _infllm2_forward(
+        self,
+        *,
+        q,
+        k,
+        v,
+        q_rope,
+        k_rope,
+        layer,
+        forward_batch,
+        window_size: tuple,
+        causal: bool,
+        mode: str,
+    ):
+        """
+        统一的稀疏前向（decode/extend）。
+        - Stage-1：用 sidecar 的 C1/C2 + TopK 得到块级候选
+        - 映射成 token 区间（合并 Sink/SW）
+        - Stage-2：把区间交给 FA3 稀疏算子（MLA/MHA 统一在算子里分支）
+        """
+        device = q.device
+        bs = forward_batch.batch_size
+        # === 取 KV 池 ===
+        if not self.use_mla:
+            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
+            # page 视图
+            K_pages = key_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            )
+            V_pages = value_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            )
+            # 展平成“逐 token 池”
+            K_flat = K_pages.reshape(
+                -1, layer.tp_k_head_num, layer.head_dim
+            )  # [PoolTok,Hk,D]
+        else:
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+                q.dtype
+            )
+            k_rope_pages = kv_cache[:, :, layer.v_head_dim :]
+            c_kv_pages = kv_cache[:, :, : layer.v_head_dim]
+            K_pages = k_rope_pages.view(
+                -1,
+                self.page_size,
+                layer.tp_k_head_num,
+                layer.head_dim - layer.v_head_dim,
+            )
+            C_pages = c_kv_pages.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+            )
+            K_flat = C_pages.reshape(
+                -1, layer.tp_v_head_num, layer.v_head_dim
+            )  # Stage-1 用“内容通道”做粗筛
+
+        # === 组装每个样本的 c1/c2/offsets ===
+        meta = self.forward_metadata
+        page_table = meta.page_table  # [B, ceil(Sk/ps)]，已是 page_id（init 时除过 ps）
+        cache_seqlens = meta.cache_seqlens_int32  # [B]
+        c1_list, c2_list, offs_list, sc1_len_list, Sk_list = [], [], [], [], []
+        for b in range(bs):
+            Sk = int(cache_seqlens[b].item())
+            if Sk <= 0:
+                # 占位
+                empty = torch.empty(
+                    (1, 1, 0, K_flat.shape[-1]), device=device, dtype=K_flat.dtype
+                )
+                c1_list.append(empty)
+                c2_list.append(empty)
+                offs_list.append(
+                    torch.tensor([[[0]]], device=device, dtype=torch.int32)
+                )
+                sc1_len_list.append(torch.tensor([0], device=device, dtype=torch.int32))
+                Sk_list.append(0)
+                continue
+            tok_idx = self._build_token_indices_for_sample(Sk, page_table[b])
+            kv_indptr = torch.tensor([0, Sk], device=device, dtype=torch.int32)
+            # BlockCtxMem 以 request_id+layer_id 做 key（稳定）
+            req_id = getattr(forward_batch, "request_ids", None)
+            rid = (
+                str(req_id[b])
+                if req_id is not None
+                else f"req_{int(forward_batch.req_pool_indices[b].item())}"
+            )
+            c1, c2, offs, sc1_len, Sk_vis = ensure_c1c2_for_sample(
+                self.infllm2_ctx_mgr,
+                rid,
+                layer.layer_id,
+                K_pool=K_flat,
+                kv_indptr=kv_indptr,
+                kv_indices=tok_idx,
+                b=0,
+            )
+            c1_list.append(c1)
+            c2_list.append(c2)
+            offs_list.append(offs)
+            sc1_len_list.append(sc1_len)
+            Sk_list.append(Sk_vis)
+        # [B, Hk, Sc*, D] / [B,Hk,n+1]
+        c1 = torch.cat(c1_list, dim=0)
+        c2 = torch.cat(c2_list, dim=0)
+        offs = torch.cat(offs_list, dim=0)  # [B,1,n+1]
+        # 广播成 [B,Hk,n+1]，用于 per-head 映射
+        offs_bhk = offs.expand(-1, c1.shape[1], -1).contiguous()
+
+        # === Stage-1：选 TopK 块（按 c1/c2）===
+        # q → [B, Hq, Dqk]；若 GQA（Hq!=Hk），建议在算子内部做组内均值/汇聚
+        if not self.use_mla:
+            q_in = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        else:
+            if q_rope is not None:
+                q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                q_in = q_all[:, :, : layer.v_head_dim]  # 内容通道用于 Stage-1
+            else:
+                q_in = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        # 调用你们的 Stage-1（若不可用则回退 dense）
+        try:
+            topk_idx_bshk = infllm2_stage1_select_blocks(
+                q_in,
+                c1,
+                c2,
+                offs,
+                sc1_len=torch.stack(sc1_len_list).to(device),
+                topk=self.infllm2_topk_blocks,
+                softmax_scale=layer.scaling,
+            )  # 期望：[B, Sq(=1 or extend_len), Hk, K]
+        except Exception:
+            return self.forward_decode.__wrapped__(
+                self,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=True,
+                q_rope=q_rope,
+                k_rope=k_rope,
+            )
+
+        # === 块→token 区间（∪ Sink/SW）===
+        ranges = blocks_to_token_ranges(
+            topk_idx_bshk=topk_idx_bshk,
+            c1_block_offsets_bhk=offs_bhk,
+            block_size=self.infllm2_cfg.block_size,
+            sink_len=self.infllm2_sink_tokens,
+            sw_span=self.infllm2_sw_span,
+            Sk_vis=max(Sk_list) if bs > 0 else 0,
+        )
+
+        # === Stage-2：稀疏注意力（FA3 varlen/sparse 适配；MLA/MHA 内部分支）===
+        if not self.use_mla:
+            out = infllm2_stage2_sparse_attention(
+                q=q_in,
+                k_pages=K_pages,
+                v_pages=V_pages,
+                page_table=page_table,  # [B, ceil(Sk/ps)]
+                token_ranges=ranges,  # python list of (s,e)
+                page_size=int(self.page_size),
+                softmax_scale=layer.scaling,
+                causal=causal,
+                window_size=window_size,
+                logit_cap=layer.logit_cap,
+                return_softmax_lse=False,
+            )
+            return out.view(-1, layer.tp_q_head_num * layer.head_dim)
+        else:
+            # MLA：Stage-2 需要 q_nope / q_rope + c_kv_pages / k_rope_pages
+            if q_rope is not None:
+                q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                q_nope = q_all[:, :, : layer.v_head_dim]
+                q_rope = q_all[:, :, layer.v_head_dim :]
+            else:
+                q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                q_rope = None  # 内部可直接从 q_all 切
+            out = infllm2_stage2_sparse_attention(
+                q=q_rope,
+                qv=q_nope,  # q_rope 做“位置信号”路，q_nope 做“内容路”
+                k_pages=K_pages,
+                v_pages=C_pages,  # k_pages=RoPE 小通道，v_pages=内容潜变量 c
+                page_table=page_table,
+                token_ranges=ranges,
+                page_size=int(self.page_size),
+                softmax_scale=layer.scaling,
+                causal=causal,
+                window_size=window_size,
+                logit_cap=layer.logit_cap,
+                is_mla=True,
+            )
+            return out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -752,6 +1023,21 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
             cu_seqlens_k = metadata.cu_seqlens_k
+
+        # ---- InfLLM-v2 稀疏路径（prefill/extend）----
+        if self._should_use_infllm2(layer, use_local_attn, forward_batch):
+            return self._infllm2_forward(
+                q=q,
+                k=k,
+                v=v,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                layer=layer,
+                forward_batch=forward_batch,
+                window_size=window_size,
+                causal=False,
+                mode="extend",
+            )
 
         # Use Flash Attention for prefill
         if not self.use_mla:
@@ -1028,6 +1314,22 @@ class FlashAttentionBackend(AttentionBackend):
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+
+        # ---- InfLLM-v2 稀疏路径：MLA/MHA 均可；不支持 cross-attn & local-attn ----
+        if self._should_use_infllm2(layer, use_local_attn, forward_batch):
+            return self._infllm2_forward(
+                q=q,
+                k=k,
+                v=v,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                layer=layer,
+                forward_batch=forward_batch,
+                window_size=window_size,
+                causal=causal,
+                mode="decode",
+            )
+
         if not self.use_mla:
             # Do multi-head attention
 
