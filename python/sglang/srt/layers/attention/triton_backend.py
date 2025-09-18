@@ -24,6 +24,25 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
+# === InfLLM-v2 稀疏路径依赖 ===
+try:
+    # Stage-1/2 的 Python 封装（见下文 triton 算子）
+    from sglang.srt.layers.attention.triton_ops.infllmv2 import (
+        infllm2_build_kv_indices_from_ranges,  # (ranges, req_to_token, req_pool_indices) -> kv_indptr/kv_indices
+    )
+    from sglang.srt.layers.attention.triton_ops.infllmv2 import (
+        infllm2_stage1_select_blocks,  # (q, c1, c2, offs, sc1_len, topk) -> topk_idx
+    )
+except Exception:
+    infllm2_stage1_select_blocks = None
+    infllm2_build_kv_indices_from_ranges = None
+from sglang.srt.mem_cache.infllmv2_context import (
+    ContextMemoryManager,
+    KVViewsConfig,
+    ensure_c1c2_for_sample,
+)
+from sglang.srt.sparse_utils.range_mapping import blocks_to_token_ranges
+
 
 def logit_capping_mod(logit_capping_method, logit_cap):
     # positive logit_cap -> tanh cap
@@ -161,6 +180,17 @@ class TritonAttnBackend(AttentionBackend):
 
         # Initialize forward metadata
         self.forward_metadata: ForwardMetadata = None
+
+        # === InfLLM-v2 开关（不存在也不报错）===
+        srv = getattr(model_runner, "server_args", None)
+        self.enable_infllmv2 = bool(getattr(srv, "enable_infllmv2", False))
+        self.infllm2_topk_blocks = int(getattr(srv, "infllmv2_topk_blocks", 4))
+        self.infllm2_sink_tokens = int(getattr(srv, "infllmv2_sink_tokens", 64))
+        self.infllm2_sw_span = int(getattr(srv, "infllmv2_sw_span", 256))
+        self.infllm2_cfg = KVViewsConfig(block_size=64)  # 与 Stage-2 block 保持一致
+        self.infllm2_ctx_mgr = ContextMemoryManager(
+            self.infllm2_cfg, device=self.device, dtype=torch.float16
+        )
 
     def get_num_kv_splits(
         self,
@@ -795,6 +825,11 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
 
+        if self._should_use_infllm2(layer, forward_batch, mode="extend"):
+            return self._infllm2_forward_triton(
+                q, k, v, layer, forward_batch, sinks=sinks, mode="extend"
+            )
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -852,6 +887,12 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
 
+        # --- InfLLM-v2 稀疏路径 ---
+        if self._should_use_infllm2(layer, forward_batch, mode="decode"):
+            return self._infllm2_forward_triton(
+                q, k, v, layer, forward_batch, sinks=sinks, mode="decode"
+            )
+
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -869,6 +910,207 @@ class TritonAttnBackend(AttentionBackend):
             xai_temperature_len=layer.xai_temperature_len,
         )
         return o
+
+    def _should_use_infllm2(
+        self, layer, forward_batch: ForwardBatch, mode: str
+    ) -> bool:
+        if not self.enable_infllmv2:
+            return False
+        if layer.attn_type == AttentionType.ENCODER_ONLY:  # cross-attn 暂不走稀疏
+            return False
+        if (
+            forward_batch.spec_info is not None
+            and self.num_draft_tokens
+            and self.num_draft_tokens > 0
+        ):
+            # 先不支持 Spec-Decode 的级联，在这条后端回退 dense
+            return False
+        if (
+            infllm2_stage1_select_blocks is None
+            or infllm2_build_kv_indices_from_ranges is None
+        ):
+            return False
+        return True
+
+    @torch.no_grad()
+    def _infllm2_forward_triton(
+        self, q, k, v, layer, forward_batch: ForwardBatch, *, sinks=None, mode: str
+    ):
+        """
+        统一的稀疏前向（extend/decode）：
+        1) 取完整历史 token 的索引（kv_indptr=[0,Sk], kv_indices）
+        2) ensure_c1c2_for_sample：增量维护/生成 C1、C2 及块前缀 offs
+        3) Stage-1：Top-K 块选择（按 Hk），得到每样本所有 head 的块集合
+        4) 并成样本级 token 区间（∪ Sink/SW）
+        5) Stage-2：把区间生成稀疏 kv_indices/kv_indptr
+        6) 调用原 triton decode/extend kernel 计算输出
+        """
+        device = q.device
+        bs = forward_batch.batch_size
+
+        # key/value 池（triton kernel 以“池 + indices”的方式取数）
+        key_pool = forward_batch.token_to_kv_pool.get_key_buffer(
+            layer.layer_id
+        )  # [PoolTok, Hk, D]
+        value_pool = forward_batch.token_to_kv_pool.get_value_buffer(
+            layer.layer_id
+        )  # [PoolTok, Hk, Dv]
+
+        # ---- 1) dense 的历史索引（只为构建 C1/C2）----
+        seq_lens = forward_batch.seq_lens
+        kv_indptr_full = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+        kv_indptr_full[1:] = torch.cumsum(seq_lens, dim=0)
+        kv_indices_full = torch.empty(
+            kv_indptr_full[-1].item(), dtype=torch.int64, device=device
+        )
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            seq_lens,
+            kv_indptr_full,
+            None,
+            kv_indices_full,
+            self.req_to_token.stride(0),
+        )
+
+        # ---- 2) Sidecar：生成/增量更新 C1/C2/offs ----
+        c1_list, c2_list, offs_list, sc1_len_list = [], [], [], []
+        for b in range(bs):
+            s = int(seq_lens[b].item())
+            if s == 0:
+                # 占位
+                tmp = key_pool.new_empty((1, key_pool.shape[1], 0, key_pool.shape[2]))
+                c1_list.append(tmp)
+                c2_list.append(tmp)
+                offs_list.append(torch.zeros((1, 1), dtype=torch.int32, device=device))
+                sc1_len_list.append(torch.zeros((), dtype=torch.int32, device=device))
+                continue
+            kv_indptr_b = kv_indptr_full[b : b + 2].clone()
+            kv_indices_b = kv_indices_full[kv_indptr_b[0] : kv_indptr_b[1]]
+            # 用 request id 作为上下文 key，稳定复用 sidecar
+            req_id = getattr(forward_batch, "request_ids", None)
+            rid = (
+                str(req_id[b])
+                if req_id is not None
+                else f"req_{int(forward_batch.req_pool_indices[b].item())}"
+            )
+            c1, c2, offs, sc1_len, _ = ensure_c1c2_for_sample(
+                self.infllm2_ctx_mgr,
+                rid,
+                layer.layer_id,
+                K_pool=key_pool,
+                kv_indptr=kv_indptr_b,
+                kv_indices=kv_indices_b,
+                b=0,
+            )
+            c1_list.append(c1)
+            c2_list.append(c2)
+            offs_list.append(offs)
+            sc1_len_list.append(sc1_len)
+        c1 = torch.cat(c1_list, dim=0)  # [B,Hk,Sc1,D]
+        c2 = torch.cat(c2_list, dim=0)  # [B,Hk,Sc2,D]
+        offs = torch.cat(offs_list, dim=0)  # [B,1, n+1]  (块前缀索引/轻页表)
+        valid_sc1_len = torch.stack(sc1_len_list)  # [B]
+
+        # ---- 3) Stage-1：Top-K 块（按 Hk）----
+        # q 形状：decode 为 [B, Hq*D]；extend 为 [*, Hq, D]。统一成 [B,Hq,D] 再做 GQA 汇聚。
+        if mode == "decode":
+            q_bhd = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        else:
+            q_bhd = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        # GQA：把 Hq 聚成 Hk
+        group = layer.tp_q_head_num // (layer.tp_k_head_num)
+        if group > 1:
+            q_bhd = q_bhd.view(bs, layer.tp_k_head_num, group, layer.qk_head_dim).mean(
+                dim=2
+            )
+        else:
+            q_bhd = q_bhd
+        topk_idx = infllm2_stage1_select_blocks(
+            q_bhd,
+            c1,
+            c2,
+            offs,
+            valid_sc1_len.view(-1, 1).expand(-1, c1.shape[1]).contiguous(),
+            topk=self.infllm2_topk_blocks,
+            softmax_scale=layer.scaling,
+        )  # [B,Hk,K]
+
+        # ---- 4) 各 head 的块 → 样本级 token 区间（并集 + Sink/SW）----
+        ranges = blocks_to_token_ranges(
+            topk_idx_bshk=topk_idx,  # [B,Hk,K]
+            c1_block_offsets_bhk=offs.expand(
+                -1, c1.shape[1], -1
+            ).contiguous(),  # [B,Hk,n+1]
+            block_size=self.infllm2_cfg.block_size,
+            sink_len=self.infllm2_sink_tokens,
+            sw_span=self.infllm2_sw_span,
+            Sk_vis=int(seq_lens.max().item()),
+        )
+        # ranges 为 Python list(len=B)，每个元素是 [(s,e), ...]
+
+        # ---- 5) Stage-2：把区间生成 kv_indptr/kv_indices（稀疏）----
+        kv_indptr, kv_indices = infllm2_build_kv_indices_from_ranges(
+            ranges, self.req_to_token, forward_batch.req_pool_indices
+        )  # kv_indptr:[B+1]  kv_indices:[sum |ranges|]
+
+        # ---- 6) 用原 triton kernel 计算注意力 ----
+        if mode == "decode":
+            # 复用 triton decode 路径
+            o = (
+                q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+                if layer.qk_head_dim != layer.v_head_dim
+                else torch.empty_like(q)
+            )
+            self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                key_pool,
+                value_pool,
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,  # Dense 的 split 策略同样适用
+                self.max_kv_splits,
+                layer.scaling,
+                logit_cap=logit_capping_mod(
+                    layer.logit_capping_method, layer.logit_cap
+                ),
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
+            return o
+        else:
+            o = (
+                q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+                if layer.qk_head_dim != layer.v_head_dim
+                else torch.empty_like(q)
+            )
+            self.extend_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                key_pool,
+                value_pool,
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.custom_mask,
+                True if layer.attn_type != AttentionType.ENCODER_ONLY else False,
+                self.forward_metadata.mask_indptr,
+                self.forward_metadata.max_extend_len,
+                layer.scaling,
+                logit_cap=logit_capping_mod(
+                    layer.logit_capping_method, layer.logit_cap
+                ),
+                sliding_window_size=-1,
+                sinks=sinks,
+                window_kv_offsets=None,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
+            return o
 
 
 class TritonMultiStepDraftBackend:
