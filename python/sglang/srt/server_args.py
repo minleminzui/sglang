@@ -446,6 +446,12 @@ class ServerArgs:
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
 
+    # === InfLLM-v2 / Page-Attn 开关 ===
+    enable_infllmv2: bool = False  # 总开关：启用 InfLLM-v2 稀疏路径
+    infllmv2_backend: str = "triton"  # "triton" | "fa3"
+    enable_page_attn: bool = False  # 启用 Page-Attn/页表（稀疏页调度）
+    page_attn_window: int = -1  # 非必须：滑窗大小（-1 表示不启用滑窗）
+
     def __post_init__(self):
         # Check deprecated arguments
         if self.enable_ep_moe:
@@ -2505,6 +2511,33 @@ class ServerArgs:
             "--enable-flashinfer-mxfp4-moe",
             action="store_true",
             help="(Deprecated) Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
+        )
+
+        # InfLLM-v2 / Page-Attn
+        parser.add_argument(
+            "--enable-infllmv2",
+            action="store_true",
+            default=ServerArgs.enable_infllmv2,
+            help="Enable InfLLM-v2 sparse attention pipeline.",
+        )
+        parser.add_argument(
+            "--infllmv2-backend",
+            type=str,
+            choices=["triton", "fa3"],
+            default=ServerArgs.infllmv2_backend,
+            help="Backend used for InfLLM-v2 sparse kernels.",
+        )
+        parser.add_argument(
+            "--enable-page-attn",
+            action="store_true",
+            default=ServerArgs.enable_page_attn,
+            help="Enable page-level attention (paged KV + page scheduler).",
+        )
+        parser.add_argument(
+            "--page-attn-window",
+            type=int,
+            default=ServerArgs.page_attn_window,
+            help="Optional sliding/window size for page attention (-1 to disable).",
         )
 
     @classmethod

@@ -111,6 +111,10 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_symm_mem",
     "enable_custom_logit_processor",
     "disaggregation_mode",
+    "enable_infllmv2",
+    "infllmv2_backend",
+    "enable_page_attn",
+    "page_attn_window",
 ]
 
 # Put some global args for easy access
