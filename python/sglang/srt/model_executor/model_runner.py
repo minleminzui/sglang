@@ -234,6 +234,10 @@ class ModelRunner:
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
+        self.enable_infllmv2 = server_args.enable_infllmv2
+        self.infllmv2_backend = server_args.infllmv2_backend
+        self.enable_page_attn = server_args.enable_page_attn
+        self.page_attn_window = server_args.page_attn_window
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
@@ -267,6 +271,11 @@ class ModelRunner:
                 # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
                 "speculative_algorithm": self.spec_algorithm,
+                # 让后端/调度层不需要再到 model_runner 取
+                "enable_infllmv2": self.enable_infllmv2,
+                "infllmv2_backend": self.infllmv2_backend,
+                "enable_page_attn": self.enable_page_attn,
+                "page_attn_window": self.page_attn_window,
             }
         )
 
@@ -1375,6 +1384,33 @@ class ModelRunner:
                 f"Use Sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
             )
 
+    def _make_kv_allocator(self):
+        # 明确优先级：
+        #   1) SWA（滑窗混合内存）优先使用专用 allocator（如果工程里有）
+        #   2) 其次是 Page-Attn / page_size>1 走分页 allocator
+        #   3) 否则走普通 allocator
+
+        use_swa = (
+            self.is_hybrid
+            and (self.sliding_window_size is not None)
+            and (self.sliding_window_size > 0)
+            and (not getattr(self.server_args, "disable_hybrid_swa_memory", False))
+        )
+
+        if use_swa and SWATokenToKVPoolAllocator is not None:
+            return SWATokenToKVPoolAllocator(
+                page_size=self.page_size,
+                device=self.device,
+            )
+
+        if self.enable_page_attn or (self.page_size and self.page_size > 1):
+            return PagedTokenToKVPoolAllocator(
+                page_size=self.page_size,
+                device=self.device,
+            )
+
+        return TokenToKVPoolAllocator(device=self.device)
+
     def init_memory_pool(
         self,
         total_gpu_memory: int,
@@ -1581,6 +1617,28 @@ class ModelRunner:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
             )
+        elif self.enable_infllmv2:
+            # InfLLM-v2：双稀疏 KV 池（承载 C1/C2、轻页表、块级上下文内存）
+            # 这里沿用 DoubleSparseTokenToKVPool，按需把窗口/块大小/量化等从 server_args 透传
+            self.token_to_kv_pool = DoubleSparseTokenToKVPool(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                # === InfLLM-v2 特有参数（按你的实现签名补全/可选）===
+                enable_page_attn=self.enable_page_attn,
+                page_attn_window=self.page_attn_window,
+                infllmv2_backend=getattr(self, "infllmv2_backend", "auto"),
+                # c1_block=getattr(self.server_args, "c1_block", 64),
+                # c2_block=getattr(self.server_args, "c2_block", 64),
+                # use_fp8=getattr(self.server_args, "infllmv2_fp8", False),
+            )
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
                 self.max_total_num_tokens,
@@ -1660,29 +1718,35 @@ class ModelRunner:
                     need_sort=need_sort,
                 )
             else:
-                if self.page_size == 1:
-                    if self.is_hybrid:
-                        self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                            self.full_max_total_num_tokens,
-                            self.swa_max_total_num_tokens,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
-                        )
-                    else:
-                        self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
-                        )
-                else:
-                    assert not self.is_hybrid
+                # === 分配器选择策略 ===
+                # 1) InfLLM-v2 或 PageAttn：统一走分页分配器（即便 page_size==1 也允许，退化为 1 大小“页”）
+                # 2) 其次 SWA 走 SWA allocator
+                # 3) 其他情况按原逻辑
+                if (
+                    self.enable_infllmv2
+                    or self.enable_page_attn
+                    or (self.page_size > 1)
+                ):
                     self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                         self.max_total_num_tokens,
-                        page_size=self.page_size,
+                        page_size=self.page_size if self.page_size is not None else 1,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
+                elif self.is_hybrid:
+                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        self.full_max_total_num_tokens,
+                        self.swa_max_total_num_tokens,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
+                else:
+                    self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
