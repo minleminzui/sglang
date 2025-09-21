@@ -6,12 +6,24 @@ import json
 import math
 from types import SimpleNamespace
 from typing import Any, Dict, Tuple
+from urllib.parse import urlparse
 
 from sglang.bench_serving import run_benchmark as _run_one
 
 
 def _mk_args(**kw) -> SimpleNamespace:
+    # run_benchmark 里会读 args.port / args.host；即使我们用 base_url，也要占个位
+    kw.setdefault("port", None)
+    kw.setdefault("host", None)
+    kw.setdefault("base_url", None)
     return SimpleNamespace(**kw)
+
+
+def _host_port_from_url(url: str):
+    u = urlparse(url)
+    host = u.hostname or "127.0.0.1"
+    port = u.port or (443 if (u.scheme or "http") == "https" else 80)
+    return host, port
 
 
 def _fmt(x, digits=2):
@@ -111,12 +123,19 @@ def main():
         gsp_output_len=256,
     )
 
-    dense_ns = _mk_args(**common, base_url=args.dense_base_url)
+    d_host, d_port = _host_port_from_url(args.dense_base_url)
+    s_host, s_port = _host_port_from_url(args.sparse_base_url)
+
+    dense_ns = _mk_args(
+        **common, base_url=args.dense_base_url, host=d_host, port=d_port
+    )
     print("\n====== DENSE run ======")
     dense_res: Dict[str, Any] = _run_one(dense_ns)
 
     # 稀疏端：通过环境开关或服务端参数打开 InfLLM-v2
-    sparse_ns = _mk_args(**common, base_url=args.sparse_base_url)
+    sparse_ns = _mk_args(
+        **common, base_url=args.sparse_base_url, host=s_host, port=s_port
+    )
     print("\n====== SPARSE run ======")
     sparse_res: Dict[str, Any] = _run_one(sparse_ns)
 

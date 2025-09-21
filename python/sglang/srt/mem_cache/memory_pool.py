@@ -1402,7 +1402,39 @@ class DoubleSparseTokenToKVPool(KVCache):
         layer_id = layer.layer_id
         self.k_buffer[layer_id - self.start_layer][loc] = cache_k
         self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-        self.label_buffer[layer_id - self.start_layer][loc] = cache_label
+
+        buf = self.label_buffer[layer_id - self.start_layer]  # e.g. [Pool, ...] (>=1D)
+
+        # 1) 归一化 idx 到 device int64
+        if torch.is_tensor(loc):
+            idx = loc.to(device=buf.device, dtype=torch.long).reshape(-1)
+        else:
+            idx = torch.tensor([int(loc)], device=buf.device, dtype=torch.long)
+
+        # 2) 归一化 val 到 device，且数量与 idx 对齐
+        if torch.is_tensor(cache_label):
+            val = cache_label.to(device=buf.device, dtype=buf.dtype).reshape(-1)
+            if val.numel() == 1:
+                val = val.expand(idx.numel())
+            else:
+                assert val.numel() == idx.numel(), "cache_label and loc size mismatch"
+        else:
+            val = torch.full(
+                (idx.numel(),), int(cache_label), device=buf.device, dtype=buf.dtype
+            )
+
+        # 3) 根据 buf 维度扩展成可 index_copy_ 的形状
+        if buf.dim() == 1:
+            # 1D: 直接拷
+            buf.index_copy_(0, idx, val)
+        else:
+            # >=2D: 扩成 [N, *buf.shape[1:]]，表示把每个切片都整体填 val[i]
+            # 先把标量变成 [N, 1, 1, ...]，再 expand
+            expand_shape = (val.shape[0],) + buf.shape[1:]
+            val_expanded = (
+                val.view(-1, *([1] * (buf.dim() - 1))).expand(expand_shape).contiguous()
+            )
+            buf.index_copy_(0, idx, val_expanded)
 
 
 @triton.jit
