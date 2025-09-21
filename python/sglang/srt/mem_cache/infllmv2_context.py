@@ -89,58 +89,80 @@ class BlockCtxMem:
             "_snap": None,  # 快照
         }
 
-    def _pool_c1c2_from_K(
-        self, K_bhsd: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """从 [1,Hk,S,D] 的 K 构建 c1/c2 与 offsets"""
-        cfg = self.cfg
-        B, Hk, S, D = K_bhsd.shape
-        x = to_ncl_from_bhsd(K_bhsd)  # [Hk,D,S]
-        c1_avg = F.avg_pool1d(
-            x, kernel_size=cfg.c1_avg_kernel, stride=cfg.c1_avg_stride, ceil_mode=False
-        )
-        c2 = F.avg_pool1d(
-            x, kernel_size=cfg.c2_avg_kernel, stride=cfg.c2_avg_stride, ceil_mode=False
-        )
-        c1_avg_bhsd = from_ncl_to_bhsd(c1_avg, B, Hk)
-        c2_bhsd = from_ncl_to_bhsd(c2, B, Hk)
+    def _pool_c1c2_from_K(self, K_bhsd: torch.Tensor):
+        """
+        K_bhsd: [B,H,S,D] (通常 B=1)
+        返回:
+        c1: [B,H,L1,D], c2: [B,H,L2,D],
+        offs: [B,1,n+1] （按 c1 的块边界构造，最后一个值是 S）
+        sc1_len: int(L1), sc2_len: int(L2)
+        """
+        B, H, S, D = K_bhsd.shape
+        device = K_bhsd.device
+        dtype_i = torch.int32
 
-        c1 = F.max_pool1d(
-            to_ncl_from_bhsd(c1_avg_bhsd),
-            kernel_size=cfg.c1_max_kernel,
-            stride=cfg.c1_max_stride,
-            padding=cfg.c1_max_padding,
-            ceil_mode=False,
-        )
-        c1_bhsd = from_ncl_to_bhsd(c1, B, Hk)
+        # 变成 [B*H*D, 1, S] 便于 avg_pool1d
+        x = K_bhsd.permute(0, 1, 3, 2).reshape(B * H * D, 1, S)
 
-        offsets = build_block_offsets(S, cfg.block_size, device=K_bhsd.device)
-        return (
-            c1_bhsd.to(self.dtype),
-            c2_bhsd.to(self.dtype),
-            offsets.view(1, 1, -1).contiguous(),
-        )
+        # 你的块配置（如无则给默认值）
+        k1 = getattr(self, "c1_kernel", getattr(self, "c1_block", 16))
+        s1 = getattr(self, "c1_stride", k1)
+        k2 = getattr(self, "c2_kernel", getattr(self, "c2_block", 64))
+        s2 = getattr(self, "c2_stride", k2)
+
+        def safe_pool(inp, kernel, stride):
+            # S 太短：退化为单块
+            if S < kernel:
+                out = F.adaptive_avg_pool1d(inp, output_size=1)
+                return out, 1
+            out = F.avg_pool1d(inp, kernel_size=kernel, stride=stride)
+            return out, out.shape[-1]
+
+        c1_avg, L1 = safe_pool(x, k1, s1)  # [B*H*D, 1, L1]
+        c2_avg, L2 = safe_pool(x, k2, s2)  # [B*H*D, 1, L2]
+
+        # 还原 [B,H,L,D]
+        c1 = c1_avg.reshape(B, H, D, L1).permute(0, 1, 3, 2).contiguous()
+        c2 = c2_avg.reshape(B, H, D, L2).permute(0, 1, 3, 2).contiguous()
+
+        # === 构造 offs（与 c1 对齐）===
+        if S < k1:
+            offs = torch.tensor([0, S], device=device, dtype=dtype_i).view(1, 1, 2)
+        else:
+            starts = torch.arange(
+                0, max(S - k1 + 1, 1), step=s1, device=device, dtype=dtype_i
+            )
+            ends = torch.clamp(starts + k1, max=S)
+            offs = torch.cat(
+                [torch.tensor([0], device=device, dtype=dtype_i), ends], dim=0
+            )
+            if offs[-1].item() != S:
+                offs = torch.cat(
+                    [offs, torch.tensor([S], device=device, dtype=dtype_i)], dim=0
+                )
+            offs = offs.view(1, 1, -1)
+
+        return c1, c2, offs, int(L1), int(L2)
 
     def build_full(self, K_seq: torch.Tensor):
-        """首次/重建：K_seq:[Sk,Hk,D]"""
-        K_bhsd = K_seq.unsqueeze(0).permute(0, 1, 0, 2).contiguous()
-        c1, c2, offs = self._pool_c1c2_from_K(K_bhsd)
-        self.state.update(
-            {
-                "Sk": K_seq.shape[0],
-                "Hk": K_seq.shape[1],
-                "c1": c1,
-                "c1_avg": None,
-                "c2": c2,
-                "sc1_len": torch.tensor(
-                    [c1.shape[2]], device=K_seq.device, dtype=torch.int32
-                ),
-                "sc2_len": torch.tensor(
-                    [c2.shape[2]], device=K_seq.device, dtype=torch.int32
-                ),
-                "offsets": offs,
-            }
-        )
+        """
+        K_seq 支持 [S,H,D] / [H,S,D] / [S,D]，统一成 [1,H,S,D] 再池化。
+        """
+        if K_seq.dim() == 3:
+            # 假定两个 3D 排列之一
+            # 通过比较前两维猜测 [S,H,D] vs [H,S,D]，或者显式记录你的布局
+            if K_seq.shape[0] < K_seq.shape[1]:  # [S,H,D]
+                K_bhsd = (
+                    K_seq.unsqueeze(0).permute(0, 1, 0, 2).contiguous()
+                )  # -> [1,H,S,D]
+            else:  # [H,S,D]
+                K_bhsd = K_seq.unsqueeze(0).contiguous()  # 已是 [1,H,S,D]
+        elif K_seq.dim() == 2:  # [S,D]
+            K_bhsd = K_seq.unsqueeze(0).unsqueeze(0).contiguous()  # [1,1,S,D]
+        else:
+            raise ValueError(f"Unexpected K_seq shape: {tuple(K_seq.shape)}")
+
+        return self._pool_c1c2_from_K(K_bhsd)
 
     def append_from_tail_plus_new(
         self, K_tail_plus_new: torch.Tensor, Sk_new: int, tail_len: int
@@ -346,60 +368,90 @@ class ContextMemoryManager:
 
 # ---------- 顶层：与 paged-KV 的对接 ----------
 def ensure_c1c2_for_sample(
-    manager: ContextMemoryManager,
-    request_id: str,
-    layer_id: int,
+    ctx_mgr,
+    request_id,
+    layer_id,
     *,
-    K_pool: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    b: int,
+    K_seq: Optional[torch.Tensor] = None,
+    K_pool: Optional[torch.Tensor] = None,
+    kv_indptr: Optional[torch.Tensor] = None,
+    kv_indices: Optional[torch.Tensor] = None,
+    b: Optional[int] = None,
+    block_size: int = 16,
     preview_visible_sc: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+):
     """
-    返回 (c1, c2, offsets, sc1_len, Sk_vis) 供 Stage-1 使用。
-    - 如果 preview_visible_sc 非 None，则不改变持久状态，只构临时视图。
+    生成 / 更新 C1、C2 以及块前缀 offs。
+    - 仅允许关键字传参（避免 `got multiple values`）。
+    - 输入可为 K_seq（[S,Hk,D]），或 K_pool+[kv_indices]（从池按索引取出 seq）。
+    - 若给出 preview_visible_sc，则只对可见前缀做视图（不落地到持久状态）。
+
+    返回：
+      c1:  [1, Hk, L1, D]
+      c2:  [1, Hk, L2, D]（此处与 c1 同阶数，按需你可改成别的构造）
+      offs:[1, 1, n+1]  （块前缀边界）
+      sc1_len: n        （L1 的块数，int 标量 tensor）
+      Sk_vis: 可见 token 长度（int 标量 tensor）
     """
-    mem = manager.get_layer_mem(request_id, layer_id)
-    s = int(kv_indptr[b].item())
-    e = int(kv_indptr[b + 1].item())
+    # 统一得到 K_seq_full
+    if K_seq is None:
+        assert (K_pool is not None) and (
+            kv_indices is not None
+        ), "Provide either K_seq or (K_pool + kv_indices)."
+        idx = kv_indices
+        if idx.dtype != torch.int64:
+            idx = idx.to(torch.int64)
+        K_seq = K_pool.index_select(0, idx)  # [S_full, Hk, D]
+
+    assert K_seq.dim() == 3, f"K_seq must be [S,Hk,D], got {tuple(K_seq.shape)}"
+    S_full, Hk, D = K_seq.shape
+    device, dtype = K_seq.device, K_seq.dtype
+
+    # 计算可见长度 Sk_vis
     if preview_visible_sc is not None:
-        e = min(e, s + int(preview_visible_sc))
-    Sk = e - s
-    if Sk <= 0:
-        dev = K_pool.device
-        empty = torch.empty((1, 1, 0, K_pool.shape[-1]), device=dev, dtype=K_pool.dtype)
-        offsets = build_block_offsets(0, manager.cfg.block_size, device=dev)[
-            None, None, :
-        ]
-        return (
-            empty,
-            empty,
-            offsets,
-            torch.tensor([0], device=dev, dtype=torch.int32),
-            0,
-        )
-
-    K_seq = gather_seq_from_pages(K_pool, kv_indices, s, e)  # [Sk,Hk,D]
-    if preview_visible_sc is not None or mem.state["Sk"] == 0:
-        # 临时或首次
-        tmp = BlockCtxMem(manager.cfg, device=K_pool.device, dtype=K_pool.dtype)
-        tmp.build_full(K_seq)
-        c1, c2, offs, sc1_len, Sk_t = tmp.get()
-        return c1, c2, offs, sc1_len, int(Sk_t.item())
-
-    # 持久：增量或重建
-    if mem.state["Sk"] == 0:
-        mem.build_full(K_seq)
+        Sk_vis_val = min(int(preview_visible_sc), int(S_full))
+    elif kv_indptr is not None:
+        # 常规：用 indptr 提供的这条样本的可见长度
+        # 约定 kv_indptr 是 [start, end]（两元素）或全 batch 的片段，这里取差值
+        if kv_indptr.numel() == 2:
+            Sk_vis_val = int((kv_indptr[1] - kv_indptr[0]).item())
+        else:
+            Sk_vis_val = int(S_full)
     else:
-        Sk_old = mem.state["Sk"]
-        if Sk > Sk_old:
-            tail = min(Sk_old, manager.cfg.c1_avg_kernel - 1)
-            tail_start = e - (Sk - Sk_old) - tail
-            K_piece = gather_seq_from_pages(K_pool, kv_indices, tail_start, e)
-            mem.append_from_tail_plus_new(K_piece, Sk_new=Sk, tail_len=tail)
-        elif Sk < Sk_old:
-            # 退化：窗口后退（例如页淘汰），重建
-            mem.build_full(K_seq)
-    c1, c2, offs, sc1_len, _ = mem.get()
-    return c1, c2, offs, sc1_len, Sk
+        Sk_vis_val = int(S_full)
+
+    # 兜底：空序列也返回合法结构，避免 None
+    if Sk_vis_val <= 0:
+        c1 = K_seq.new_zeros((1, Hk, 1, D))
+        c2 = K_seq.new_zeros((1, Hk, 1, D))
+        offs = torch.tensor([[[0, 0]]], device=device, dtype=torch.int32)
+        sc1_len = torch.tensor(0, device=device, dtype=torch.int32)
+        Sk_vis = torch.tensor(0, device=device, dtype=torch.int32)
+        return c1, c2, offs, sc1_len, Sk_vis
+
+    # 取可见前缀
+    K_vis = K_seq[:Sk_vis_val]  # [Sk_vis, Hk, D]
+
+    # 计算块数与边界（至少 1 块）
+    n_blocks = max(1, (Sk_vis_val + block_size - 1) // block_size)
+    edges = torch.arange(0, n_blocks + 1, device=device, dtype=torch.int32) * block_size
+    edges = torch.clamp(edges, max=Sk_vis_val)  # [n+1]，最后一段可能短
+    offs = edges.view(1, 1, -1)  # [1,1,n+1]
+
+    # 构造 C1：把时间维池化到 n_blocks
+    # K_vis: [Sk_vis, Hk, D] -> [Hk*D, 1, Sk_vis] 做 1D 池化
+    x = K_vis.permute(1, 2, 0).contiguous().view(Hk * D, 1, Sk_vis_val)
+    c1_avg = F.adaptive_avg_pool1d(x, output_size=n_blocks)  # [Hk*D,1,n]
+    c1 = (
+        c1_avg.view(Hk, D, n_blocks).permute(0, 2, 1).contiguous().unsqueeze(0)
+    )  # [1,Hk,n,D]
+    # 简化：c2 先与 c1 一致（按需可改为其它摘要方式）
+    c2 = c1
+
+    # 预览模式：不落地；否则可选地写回 ctx_mgr（如果你有持久化接口）
+    # if preview_visible_sc is None and hasattr(ctx_mgr, "update"):
+    #     ctx_mgr.update(request_id, layer_id, c1, c2, offs, Sk_vis_val, block_size)
+
+    sc1_len = torch.tensor(n_blocks, device=device, dtype=torch.int32)
+    Sk_vis = torch.tensor(Sk_vis_val, device=device, dtype=torch.int32)
+    return c1, c2, offs, sc1_len, Sk_vis

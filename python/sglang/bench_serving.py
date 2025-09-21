@@ -2087,6 +2087,19 @@ def run_benchmark(args_: argparse.Namespace):
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
         )
 
+    # --- robust api_url resolution ---
+    def _resolve_api_url(args):
+        bud = getattr(args, "base_url", None)
+        if bud:
+            url = bud.rstrip("/")
+            return url if url.endswith("/v1") else (url + "/v1")
+        host = getattr(args, "host", None) or "127.0.0.1"
+        port = getattr(args, "port", None)
+        if port is None:
+            raise ValueError("Provide either base_url or host+port to run_benchmark()")
+        return f"http://{host}:{port}/v1"
+
+    api_url = _resolve_api_url(args)
     print(f"{args}\n")
 
     # Read dataset

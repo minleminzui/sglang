@@ -1417,7 +1417,7 @@ class ModelRunner:
         max_num_reqs: Optional[int] = None,
         max_total_tokens: Optional[int] = None,
     ):
-        # Determine the kv cache dtype
+        # -------- 1) KV dtype 判定（原样） --------
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
             kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
@@ -1432,22 +1432,20 @@ class ModelRunner:
             else:
                 self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
-            if _is_hip:  # Using natively supported format
-                self.kv_cache_dtype = torch.float8_e5m2fnuz
-            else:
-                self.kv_cache_dtype = torch.float8_e5m2
+            self.kv_cache_dtype = (
+                torch.float8_e5m2fnuz if _is_hip else torch.float8_e5m2
+            )
         elif self.server_args.kv_cache_dtype == "fp8_e4m3":
-            if _is_hip:  # Using natively supported format
-                self.kv_cache_dtype = torch.float8_e4m3fnuz
-            else:
-                self.kv_cache_dtype = torch.float8_e4m3fn
+            self.kv_cache_dtype = (
+                torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+            )
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
-
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
+        # -------- 2) 计算 max_total_num_tokens（原样） --------
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
         if SGLANG_CI_SMALL_KV_SIZE:
             self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
@@ -1470,21 +1468,14 @@ class ModelRunner:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 max_num_reqs = self.server_args.max_num_reqs
             else:
-                # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
-                # can be concurrently allocated, so we should give a headroom for it.
                 self.server_args.draft_runner_cache_size = (
                     self.max_total_num_tokens
-                    # draft
                     + max_num_reqs
                     * self.server_args.speculative_num_steps
                     * self.server_args.speculative_eagle_topk
-                    # verify
                     + max_num_reqs * self.server_args.speculative_num_draft_tokens
-                    # buffer
                     + 100
                 )
-                # Target worker and draft worker shares the same indices for the
-                # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 self.server_args.max_num_reqs = max_num_reqs
 
@@ -1492,17 +1483,14 @@ class ModelRunner:
             if max_total_tokens > self.max_total_num_tokens:
                 logging.warning(
                     f"max_total_tokens={max_total_tokens} is larger than the profiled value "
-                    f"{self.max_total_num_tokens}. "
-                    f"Use the profiled value instead."
+                    f"{self.max_total_num_tokens}. Use the profiled value instead."
                 )
             self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
         self.max_total_num_tokens = (
-            self.max_total_num_tokens
-            // self.server_args.page_size
-            * self.server_args.page_size
-        )
-        # different pp rank may have different num of layers, so we need to reduce the max_total_num_tokens
+            self.max_total_num_tokens // self.server_args.page_size
+        ) * self.server_args.page_size
+
         if self.pp_size > 1:
             tensor = torch.tensor(self.max_total_num_tokens, dtype=torch.int64)
             torch.distributed.all_reduce(
@@ -1512,7 +1500,6 @@ class ModelRunner:
             )
             self.max_total_num_tokens = tensor.item()
 
-        # create token size for hybrid cache
         if self.is_hybrid:
             self.set_num_token_hybrid()
 
@@ -1521,9 +1508,8 @@ class ModelRunner:
                 "Not enough memory. Please try to increase --mem-fraction-static."
             )
 
-        # Initialize req_to_token_pool
+        # -------- 3) req_to_token_pool（原样） --------
         if self.req_to_token_pool is None:
-            # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
             extra_max_context_len = 4
             if self.server_args.speculative_num_draft_tokens is not None:
                 extra_max_context_len += self.server_args.speculative_num_draft_tokens
@@ -1531,8 +1517,6 @@ class ModelRunner:
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 
-                # subscribe memory for pre-allocated requests
-                # if max_num_reqs <= 32, we pre-allocate 2x requests
                 pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
                 self.req_to_token_pool = DecodeReqToTokenPool(
                     size=max_num_reqs,
@@ -1573,10 +1557,9 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                 )
         else:
-            # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
 
-        # Initialize token_to_kv_pool
+        # -------- 4) token_to_kv_pool（关键修复：不再传 page/infllmv2 的自定义 kwargs） --------
         if self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
                 self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
@@ -1618,8 +1601,7 @@ class ModelRunner:
                 end_layer=self.end_layer,
             )
         elif self.enable_infllmv2:
-            # InfLLM-v2：双稀疏 KV 池（承载 C1/C2、轻页表、块级上下文内存）
-            # 这里沿用 DoubleSparseTokenToKVPool，按需把窗口/块大小/量化等从 server_args 透传
+            # 用 DoubleSparseTokenToKVPool 作为通用“可稀疏”的 KV 池，不传 page/infllm 专有 kwargs
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -1628,16 +1610,13 @@ class ModelRunner:
                 head_dim=self.model_config.head_dim,
                 layer_num=self.num_effective_layers,
                 device=self.device,
+                # 按此类现有签名补齐（常见需要）
+                heavy_channel_num=getattr(
+                    self.server_args, "ds_heavy_channel_num", None
+                ),
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
-                # === InfLLM-v2 特有参数（按你的实现签名补全/可选）===
-                enable_page_attn=self.enable_page_attn,
-                page_attn_window=self.page_attn_window,
-                infllmv2_backend=getattr(self, "infllmv2_backend", "auto"),
-                # c1_block=getattr(self.server_args, "c1_block", 64),
-                # c2_block=getattr(self.server_args, "c2_block", 64),
-                # use_fp8=getattr(self.server_args, "infllmv2_fp8", False),
             )
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
@@ -1677,7 +1656,6 @@ class ModelRunner:
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
-                    # if draft worker, we only need 1 attention layer's kv pool
                     full_attention_layer_ids=(
                         [0]
                         if self.is_draft_worker
@@ -1702,7 +1680,7 @@ class ModelRunner:
                     end_layer=self.end_layer,
                 )
 
-        # Initialize token_to_kv_pool_allocator
+        # -------- 5) allocator（把 infllmv2/page-attn 的“稀疏页表/块表”语义放这里） --------
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
             if _is_npu and self.server_args.attention_backend in [
@@ -1718,10 +1696,7 @@ class ModelRunner:
                     need_sort=need_sort,
                 )
             else:
-                # === 分配器选择策略 ===
-                # 1) InfLLM-v2 或 PageAttn：统一走分页分配器（即便 page_size==1 也允许，退化为 1 大小“页”）
-                # 2) 其次 SWA 走 SWA allocator
-                # 3) 其他情况按原逻辑
+                # 关键点：InfLLM-v2/PageAttn 走分页分配器，让 allocator 产生轻量页表/块级索引
                 if (
                     self.enable_infllmv2
                     or self.enable_page_attn
@@ -1756,8 +1731,7 @@ class ModelRunner:
             assert self.is_draft_worker
 
         logger.info(
-            f"Memory pool end. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"Memory pool end. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
     def init_cublas(self):
