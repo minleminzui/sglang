@@ -56,7 +56,7 @@ def main():
     ap = argparse.ArgumentParser("Dense vs InfLLM-v2 (backend-agnostic)")
     ap.add_argument("--dense-base-url", required=True)
     ap.add_argument("--sparse-base-url", required=True)
-    ap.add_argument("--backend", default="fa3", choices=["fa3", "triton"])
+    # ap.add_argument("--backend", default="triton", choices=["fa3", "triton"])
     ap.add_argument("--enable-infllmv2", action="store_true")
     ap.add_argument("--model", default=None)
     ap.add_argument(
@@ -85,7 +85,7 @@ def main():
     args = ap.parse_args()
 
     common = dict(
-        backend=args.backend,
+        backend="sglang-native",
         model=args.model,
         tokenizer=None,
         dataset_name=args.dataset_name,
