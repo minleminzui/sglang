@@ -56,7 +56,7 @@ def main():
     ap = argparse.ArgumentParser("Dense vs InfLLM-v2 (backend-agnostic)")
     ap.add_argument("--dense-base-url", required=True)
     ap.add_argument("--sparse-base-url", required=True)
-    # ap.add_argument("--backend", default="triton", choices=["fa3", "triton"])
+    ap.add_argument("--backend", default="sglang-oai")
     ap.add_argument("--enable-infllmv2", action="store_true")
     ap.add_argument("--model", default=None)
     ap.add_argument(
@@ -83,9 +83,9 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--save-json", type=str, default=None)
     args = ap.parse_args()
-
+    backend = "sglang-oai"
     common = dict(
-        backend="sglang-native",
+        backend=backend,
         model=args.model,
         tokenizer=None,
         dataset_name=args.dataset_name,
@@ -123,61 +123,79 @@ def main():
         gsp_output_len=256,
     )
 
-    d_host, d_port = _host_port_from_url(args.dense_base_url)
-    s_host, s_port = _host_port_from_url(args.sparse_base_url)
+    # 注意：OpenAI 兼容路由要用 base_url=/v1，且 host/port=None
+    if backend in (
+        "sglang-oai",
+        "sglang-oai-chat",
+        "vllm",
+        "vllm-chat",
+        "lmdeploy",
+        "lmdeploy-chat",
+    ):
+        dense_ns = _mk_args(
+            **common, base_url=args.dense_base_url, host=None, port=None
+        )
+        sparse_ns = _mk_args(
+            **common, base_url=args.sparse_base_url, host=None, port=None
+        )
+    else:
+        d_host, d_port = _host_port_from_url(args.dense_base_url)
+        s_host, s_port = _host_port_from_url(args.sparse_base_url)
+        dense_ns = _mk_args(
+            **common, base_url=args.dense_base_url, host=d_host, port=d_port
+        )
+        sparse_ns = _mk_args(
+            **common, base_url=args.sparse_base_url, host=s_host, port=s_port
+        )
 
-    dense_ns = _mk_args(
-        **common, base_url=args.dense_base_url, host=d_host, port=d_port
-    )
-    print("\n====== DENSE run ======")
-    dense_res: Dict[str, Any] = _run_one(dense_ns)
+    # print("\n====== DENSE run ======")
+    # dense_res: Dict[str, Any] = _run_one(dense_ns)
 
-    # 稀疏端：通过环境开关或服务端参数打开 InfLLM-v2
-    sparse_ns = _mk_args(
-        **common, base_url=args.sparse_base_url, host=s_host, port=s_port
-    )
     print("\n====== SPARSE run ======")
     sparse_res: Dict[str, Any] = _run_one(sparse_ns)
 
     rows = (
         (
             "Request throughput (req/s)",
-            dense_res.get("request_throughput"),
+            # dense_res.get("request_throughput"),
             sparse_res.get("request_throughput"),
         ),
         (
             "Input tok/s",
-            dense_res.get("input_throughput"),
+            # dense_res.get("input_throughput"),
             sparse_res.get("input_throughput"),
         ),
         (
             "Output tok/s",
-            dense_res.get("output_throughput"),
+            # dense_res.get("output_throughput"),
             sparse_res.get("output_throughput"),
         ),
         (
             "Total tok/s",
-            dense_res.get("total_throughput"),
+            # dense_res.get("total_throughput"),
             sparse_res.get("total_throughput"),
         ),
         (
             "Mean TTFT (ms)",
-            dense_res.get("mean_ttft_ms"),
+            # dense_res.get("mean_ttft_ms"),
             sparse_res.get("mean_ttft_ms"),
         ),
-        ("P99 TTFT (ms)", dense_res.get("p99_ttft_ms"), sparse_res.get("p99_ttft_ms")),
-        ("Mean ITL (ms)", dense_res.get("mean_itl_ms"), sparse_res.get("mean_itl_ms")),
-        ("P95 ITL (ms)", dense_res.get("p95_itl_ms"), sparse_res.get("p95_itl_ms")),
+        # ("P99 TTFT (ms)", dense_res.get("p99_ttft_ms"), sparse_res.get("p99_ttft_ms")),
+        # ("Mean ITL (ms)", dense_res.get("mean_itl_ms"), sparse_res.get("mean_itl_ms")),
+        # ("P95 ITL (ms)", dense_res.get("p95_itl_ms"), sparse_res.get("p95_itl_ms")),
+        ("P99 TTFT (ms)", sparse_res.get("p99_ttft_ms")),
+        ("Mean ITL (ms)", sparse_res.get("mean_itl_ms")),
+        ("P95 ITL (ms)", sparse_res.get("p95_itl_ms")),
         (
             "Mean E2E Latency (ms)",
-            dense_res.get("mean_e2e_latency_ms"),
+            # dense_res.get("mean_e2e_latency_ms"),
             sparse_res.get("mean_e2e_latency_ms"),
         ),
-        ("Concurrency", dense_res.get("concurrency"), sparse_res.get("concurrency")),
-        ("Completed requests", dense_res.get("completed"), sparse_res.get("completed")),
+        # ("Concurrency", dense_res.get("concurrency"), sparse_res.get("concurrency")),
+        # ("Completed requests", dense_res.get("completed"), sparse_res.get("completed")),
         (
             "Total output tokens",
-            dense_res.get("total_output_tokens"),
+            # dense_res.get("total_output_tokens"),
             sparse_res.get("total_output_tokens"),
         ),
     )
@@ -185,7 +203,7 @@ def main():
 
     if args.save_json:
         payload = {
-            "dense": dense_res,
+            # "dense": dense_res,
             "sparse": sparse_res,
             "compare": {n: {"dense": dv, "sparse": sv} for (n, dv, sv) in rows},
         }
