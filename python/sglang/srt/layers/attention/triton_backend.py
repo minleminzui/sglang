@@ -233,6 +233,69 @@ class TritonAttnBackend(AttentionBackend):
             self.infllm2_cfg = None
             self.infllm2_ctx_mgr = None
 
+    def _is_capturing(self) -> bool:
+        f = getattr(torch.cuda, "is_current_stream_capturing", None)
+        if callable(f):
+            return bool(f())
+        g = getattr(torch.cuda, "_is_in_graph_capture_mode", None)
+        return bool(g()) if callable(g) else False
+
+    def _ensure_infllm2_workspace(self, bs: int, Rcap: int):
+        """在非捕获期，确保 ranges 的工作区容量 >= bs；不足则扩容。"""
+        need_bs = max(1, int(bs))
+        need_ranges = need_bs * Rcap
+
+        cur_bs_cap = getattr(self, "infllm2_bs_cap", 0)
+        ok = (
+            hasattr(self, "infllm2_range_indptr")
+            and hasattr(self, "infllm2_range_starts")
+            and hasattr(self, "infllm2_range_lens")
+            and cur_bs_cap >= need_bs
+            and self.infllm2_range_starts.numel() >= need_ranges
+            and self.infllm2_range_lens.numel() >= need_ranges
+        )
+        if ok:
+            return
+
+        # 非捕获期才允许扩容
+        assert not self._is_capturing(), "should not realloc workspace while capturing"
+
+        # 适当留点余量，减少后续扩容次数
+        new_bs_cap = max(need_bs, cur_bs_cap * 2 if cur_bs_cap > 0 else need_bs)
+        new_ranges = max(
+            need_ranges,
+            (
+                self.infllm2_range_starts.numel() * 2
+                if hasattr(self, "infllm2_range_starts")
+                else need_ranges
+            ),
+        )
+
+        self.infllm2_range_indptr = torch.zeros(
+            (new_bs_cap + 1,), dtype=torch.int32, device=self.device
+        )
+        self.infllm2_range_starts = torch.zeros(
+            (new_ranges,), dtype=torch.int32, device=self.device
+        )
+        self.infllm2_range_lens = torch.zeros_like(self.infllm2_range_starts)
+        self.infllm2_bs_cap = new_bs_cap
+
+    def _ensure_kv_indices_capacity(self, needed_tokens: int):
+        """确保用于写入稀疏 kv_indices 的大缓冲容量足够（非捕获期允许扩容）。"""
+        cap = getattr(self, "infllm2_kv_idx_cap", 0)
+        has_buf = (
+            hasattr(self, "cuda_graph_kv_indices")
+            and self.cuda_graph_kv_indices.numel() >= needed_tokens
+        )
+        if has_buf:
+            return
+        assert not self._is_capturing(), "should not realloc kv buffer while capturing"
+        new_cap = max(needed_tokens, cap * 2 if cap > 0 else needed_tokens)
+        self.cuda_graph_kv_indices = torch.empty(
+            (new_cap,), dtype=torch.int64, device=self.device
+        )
+        self.infllm2_kv_idx_cap = new_cap
+
     def get_num_kv_splits(
         self,
         num_kv_splits: torch.Tensor,
@@ -1228,41 +1291,48 @@ class TritonAttnBackend(AttentionBackend):
             Sk_vis=int(seq_lens.max().item()),
         )
 
-        # 5) ranges -> indices （落到预分配 workspace）
-        Rcap = getattr(self, "infllm2_R_cap", 64)
-        if not hasattr(self, "infllm2_range_starts"):
-            # 非捕获期允许延迟分配
-            self.infllm2_range_starts = torch.zeros(
-                (max(bs, 1) * Rcap,), dtype=torch.int32, device=device
-            )
-            self.infllm2_range_lens = torch.zeros_like(self.infllm2_range_starts)
-            self.infllm2_range_indptr = torch.zeros(
-                (max(bs, 1) + 1,), dtype=torch.int32, device=device
-            )
+        # --- 5) ranges → 稀疏 kv_indices/kv_indptr（全部写入预分配 workspace）---
+        Rcap = getattr(
+            self, "infllm2_R_cap", 96
+        )  # 建议从 64 提到 96/128，减少被截断概率
+        # 确保 workspace 容量足够当前 bs
+        self._ensure_infllm2_workspace(bs, Rcap)
 
-        self.infllm2_range_indptr.zero_()
-        self.infllm2_range_starts.zero_()
-        self.infllm2_range_lens.zero_()
+        # 清零头部（不会重新分配）
+        self.infllm2_range_indptr[: bs + 1].zero_()
+        # 注：starts/lens 只清本批次可能写到的片段前缀；全清也可
+        self.infllm2_range_starts[: bs * Rcap].zero_()
+        self.infllm2_range_lens[: bs * Rcap].zero_()
 
-        kv_indptr_out = self.forward_metadata.kv_indptr  # 用它承载“稀疏”的 indptr
-        kv_indptr_out.zero_()
+        kv_indptr_out = self.forward_metadata.kv_indptr
+        kv_indptr_out[: bs + 1].zero_()
 
-        tok_total, r_ptr = 0, 0
+        tok_total = 0
+        r_ptr = 0
         for b in range(bs):
+            # ★ 这里不会越界了，因为 indptr 的长度是 (bs_cap+1) 并且 >= bs+1
             self.infllm2_range_indptr[b] = r_ptr
+            wrote = 0
             for s, e in _iter_segments_safe(ranges[b]):
                 n = e - s
                 if n <= 0:
                     continue
-                if r_ptr >= (b + 1) * Rcap:
+                # 每个样本最多写 Rcap 段，防止越界
+                if wrote >= Rcap:
+                    # 这里可以记录一次水位告警（可选）
                     break
-                self.infllm2_range_starts[r_ptr] = int(s)
-                self.infllm2_range_lens[r_ptr] = int(n)
+                self.infllm2_range_starts[b * Rcap + wrote] = int(s)
+                self.infllm2_range_lens[b * Rcap + wrote] = int(n)
                 r_ptr += 1
+                wrote += 1
                 tok_total += n
             kv_indptr_out[b + 1] = tok_total
         self.infllm2_range_indptr[bs] = r_ptr
 
+        # 确保 kv_indices 大缓冲容量足够 tok_total
+        self._ensure_kv_indices_capacity(tok_total)
+
+        # Triton kernel：把 ranges 映射为 token indices，直接写大缓冲的前 tok_total 段
         from sglang.srt.layers.attention.triton_ops.infllmv2 import (
             _ranges_to_indices_kernel,
         )
@@ -1273,11 +1343,11 @@ class TritonAttnBackend(AttentionBackend):
             req.stride(0),
             req.stride(1),
             forward_batch.req_pool_indices.to(dtype=torch.int32, device=req.device),
-            self.infllm2_range_indptr,
-            self.infllm2_range_starts,
-            self.infllm2_range_lens,
-            kv_indptr_out,  # << 稀疏 indptr 已写好
-            self.cuda_graph_kv_indices,  # << 稀疏 indices 写到预分配大缓冲
+            self.infllm2_range_indptr,  # [bs+1]
+            self.infllm2_range_starts,  # [bs*Rcap]
+            self.infllm2_range_lens,  # [bs*Rcap]
+            kv_indptr_out,  # [bs+1]
+            self.cuda_graph_kv_indices,  # 目标缓冲（容量已保证）
             pool_w=req.shape[1],
             BLOCK=128,
         )
