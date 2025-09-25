@@ -1,6 +1,7 @@
 # /sgl-workspace/sglang/python/sglang/srt/layers/attention/triton_backend.py
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -219,13 +220,15 @@ class TritonAttnBackend(AttentionBackend):
             self.infllm2_topk_blocks = int(getattr(srv, "infllmv2_topk_blocks", 4))
             self.infllm2_sink_tokens = int(getattr(srv, "infllmv2_sink_tokens", 64))
             self.infllm2_sw_span = int(getattr(srv, "infllmv2_sw_span", 256))
-            self.infllm2_cfg = KVViewsConfig(block_size=64)
+            self.infllm2_cfg = KVViewsConfig(block_size=128)
             self.infllm2_ctx_mgr = ContextMemoryManager(
                 self.infllm2_cfg, device=self.device, dtype=torch.float16
             )
-            self.infllm2_R_cap = max(
-                self.num_kv_head * self.infllm2_topk_blocks * 2 + 8, 64
-            )
+            # Rcap：每个样本最多允许的区间条目；可用环境变量覆盖
+            # rcap_default = max(self.num_kv_head * self.infllm2_topk_blocks * 2 + 8, 96)
+            rcap_default = 2048
+            self.infllm2_R_cap = int(os.getenv("SGLANG_INFLLM2_R_CAP", rcap_default))
+            self._infllm2_seen_len = {}
         else:
             self.infllm2_topk_blocks = 0
             self.infllm2_sink_tokens = 0
@@ -1052,19 +1055,36 @@ class TritonAttnBackend(AttentionBackend):
         )
         return o
 
-    def _should_use_infllm2(
-        self, layer, forward_batch: ForwardBatch, mode: str
-    ) -> bool:
+    # def _should_use_infllm2(
+    #     self, layer, forward_batch: ForwardBatch, mode: str
+    # ) -> bool:
+    #     if not self.enable_infllmv2:
+    #         return False
+    #     if layer.attn_type == AttentionType.ENCODER_ONLY:  # cross-attn 暂不走稀疏
+    #         return False
+    #     if (
+    #         forward_batch.spec_info is not None
+    #         and self.num_draft_tokens
+    #         and self.num_draft_tokens > 0
+    #     ):
+    #         # 先不支持 Spec-Decode 的级联，在这条后端回退 dense
+    #         return False
+    #     if (
+    #         infllm2_stage1_select_blocks is None
+    #         or infllm2_build_kv_indices_from_ranges is None
+    #     ):
+    #         return False
+    #     return True
+
+    def _should_use_infllm2(self, layer, forward_batch, mode: str) -> bool:
         if not self.enable_infllmv2:
             return False
-        if layer.attn_type == AttentionType.ENCODER_ONLY:  # cross-attn 暂不走稀疏
+        if mode != "decode":  # ⬅️ 关键：只在 decode 用稀疏
             return False
-        if (
-            forward_batch.spec_info is not None
-            and self.num_draft_tokens
-            and self.num_draft_tokens > 0
-        ):
-            # 先不支持 Spec-Decode 的级联，在这条后端回退 dense
+        if layer.attn_type == AttentionType.ENCODER_ONLY:
+            return False
+        spec = forward_batch.spec_info
+        if spec is not None and self.num_draft_tokens and self.num_draft_tokens > 0:
             return False
         if (
             infllm2_stage1_select_blocks is None
@@ -1072,6 +1092,9 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return False
         return True
+
+    def _evt():
+        return torch.cuda.Event(enable_timing=True)
 
     @torch.no_grad()
     def _infllm2_forward_triton(
@@ -1169,26 +1192,35 @@ class TritonAttnBackend(AttentionBackend):
         for b in range(bs):
             rid = int(req_row[b].item())
             S = int(seq_lens[b].item())
+            rid_str = str(req_id[b]) if req_id is not None else f"req_{rid}"
+            key_tag = (rid_str, int(layer.layer_id))
 
-            if S > 0:
-                idx = self.req_to_token[rid, :S].to(torch.int64)
-                # Page/SWA 映射（若启用）
+            S_prev = self._infllm2_seen_len.get(key_tag, 0)
+            S_prev = min(S_prev, S)  # 防御（上下游重置/截断时不会越界）
+
+            # 只取“新增”的 [S_prev:S]
+            if S > S_prev:
+                idx_new = self.req_to_token[rid, S_prev:S].to(torch.int64)
                 if hasattr(
                     self.token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"
                 ):
-                    idx = (
+                    idx_new = (
                         self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                            idx
+                            idx_new
                         )
                     )
-                K_seq = key_pool.index_select(0, idx)  # [S,Hk,D]
+                K_new = key_pool.index_select(0, idx_new)  # [ΔS, Hk, D]
             else:
-                K_seq = key_pool[:0]  # 空视图
+                # 用一个 0 长度的张量表达“这步没有新 token”
+                K_new = key_pool[:0]
 
-            rid_str = str(req_id[b]) if req_id is not None else f"req_{rid}"
+            # 让 ctx_mgr 只用 K_new 做增量更新（不必重扫历史）
             c1, c2, offs, L1, L2 = ensure_c1c2_for_sample(
-                self.infllm2_ctx_mgr, rid_str, layer.layer_id, K_seq=K_seq
+                self.infllm2_ctx_mgr, rid_str, layer.layer_id, K_seq=K_new
             )
+
+            # 更新“已处理长度”
+            self._infllm2_seen_len[key_tag] = S
             assert (
                 (c1 is not None) and (c2 is not None) and (offs is not None)
             ), "ensure_c1c2_for_sample must not return None"
@@ -1291,44 +1323,36 @@ class TritonAttnBackend(AttentionBackend):
             Sk_vis=int(seq_lens.max().item()),
         )
 
-        # --- 5) ranges → 稀疏 kv_indices/kv_indptr（全部写入预分配 workspace）---
-        Rcap = getattr(
-            self, "infllm2_R_cap", 96
-        )  # 建议从 64 提到 96/128，减少被截断概率
-        # 确保 workspace 容量足够当前 bs
+        # --- 5) ranges → 稀疏 kv_indices/kv_indptr（写入预分配 workspace，紧凑布局）---
+        Rcap = int(getattr(self, "infllm2_R_cap", 128))
         self._ensure_infllm2_workspace(bs, Rcap)
 
-        # 清零头部（不会重新分配）
+        # 只清需要用到的前缀，避免新分配
         self.infllm2_range_indptr[: bs + 1].zero_()
-        # 注：starts/lens 只清本批次可能写到的片段前缀；全清也可
-        self.infllm2_range_starts[: bs * Rcap].zero_()
-        self.infllm2_range_lens[: bs * Rcap].zero_()
-
         kv_indptr_out = self.forward_metadata.kv_indptr
         kv_indptr_out[: bs + 1].zero_()
 
+        max_ranges = bs * Rcap  # 全局可写的最大条数
+        r_ptr = 0  # 全局写指针（紧凑递增）
         tok_total = 0
-        r_ptr = 0
         for b in range(bs):
-            # ★ 这里不会越界了，因为 indptr 的长度是 (bs_cap+1) 并且 >= bs+1
             self.infllm2_range_indptr[b] = r_ptr
-            wrote = 0
+            wrote_in_b = 0
             for s, e in _iter_segments_safe(ranges[b]):
+                if wrote_in_b >= Rcap or r_ptr >= max_ranges:
+                    break
                 n = e - s
                 if n <= 0:
                     continue
-                # 每个样本最多写 Rcap 段，防止越界
-                if wrote >= Rcap:
-                    # 这里可以记录一次水位告警（可选）
-                    break
-                self.infllm2_range_starts[b * Rcap + wrote] = int(s)
-                self.infllm2_range_lens[b * Rcap + wrote] = int(n)
+                # ★ 紧凑写：所有样本的条目连在一起
+                self.infllm2_range_starts[r_ptr] = int(s)
+                self.infllm2_range_lens[r_ptr] = int(n)
                 r_ptr += 1
-                wrote += 1
+                wrote_in_b += 1
                 tok_total += n
             kv_indptr_out[b + 1] = tok_total
+        # 末端
         self.infllm2_range_indptr[bs] = r_ptr
-
         # 确保 kv_indices 大缓冲容量足够 tok_total
         self._ensure_kv_indices_capacity(tok_total)
 
@@ -1338,16 +1362,17 @@ class TritonAttnBackend(AttentionBackend):
         )
 
         req = self.req_to_token
+        self._ensure_kv_indices_capacity(tok_total)
         _ranges_to_indices_kernel[(bs,)](
             req,
             req.stride(0),
             req.stride(1),
             forward_batch.req_pool_indices.to(dtype=torch.int32, device=req.device),
             self.infllm2_range_indptr,  # [bs+1]
-            self.infllm2_range_starts,  # [bs*Rcap]
-            self.infllm2_range_lens,  # [bs*Rcap]
+            self.infllm2_range_starts,  # [r_ptr] 有效前缀
+            self.infllm2_range_lens,  # [r_ptr] 有效前缀
             kv_indptr_out,  # [bs+1]
-            self.cuda_graph_kv_indices,  # 目标缓冲（容量已保证）
+            self.cuda_graph_kv_indices,  # 目标 token 索引大缓冲
             pool_w=req.shape[1],
             BLOCK=128,
         )
