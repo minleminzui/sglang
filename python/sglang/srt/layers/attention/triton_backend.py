@@ -1,6 +1,7 @@
 # /sgl-workspace/sglang/python/sglang/srt/layers/attention/triton_backend.py
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -69,6 +70,10 @@ def logit_capping_mod(logit_capping_method, logit_cap):
         return logit_cap
     else:
         raise ValueError()
+
+
+def _evt():
+    return torch.cuda.Event(enable_timing=True)
 
 
 @dataclass
@@ -219,13 +224,14 @@ class TritonAttnBackend(AttentionBackend):
             self.infllm2_topk_blocks = int(getattr(srv, "infllmv2_topk_blocks", 4))
             self.infllm2_sink_tokens = int(getattr(srv, "infllmv2_sink_tokens", 64))
             self.infllm2_sw_span = int(getattr(srv, "infllmv2_sw_span", 256))
-            self.infllm2_cfg = KVViewsConfig(block_size=64)
+            self.infllm2_cfg = KVViewsConfig(block_size=128)
             self.infllm2_ctx_mgr = ContextMemoryManager(
                 self.infllm2_cfg, device=self.device, dtype=torch.float16
             )
-            self.infllm2_R_cap = max(
-                self.num_kv_head * self.infllm2_topk_blocks * 2 + 8, 64
-            )
+            # Rcap：每个样本最多允许的区间条目；可用环境变量覆盖
+            self.infllm2_R_cap = int(os.getenv("SGLANG_INFLLM2_RCAP", "64"))
+            self._infllm2_seen_len = {}
+
         else:
             self.infllm2_topk_blocks = 0
             self.infllm2_sink_tokens = 0
@@ -1052,19 +1058,36 @@ class TritonAttnBackend(AttentionBackend):
         )
         return o
 
-    def _should_use_infllm2(
-        self, layer, forward_batch: ForwardBatch, mode: str
-    ) -> bool:
+    # def _should_use_infllm2(
+    #     self, layer, forward_batch: ForwardBatch, mode: str
+    # ) -> bool:
+    #     if not self.enable_infllmv2:
+    #         return False
+    #     if layer.attn_type == AttentionType.ENCODER_ONLY:  # cross-attn 暂不走稀疏
+    #         return False
+    #     if (
+    #         forward_batch.spec_info is not None
+    #         and self.num_draft_tokens
+    #         and self.num_draft_tokens > 0
+    #     ):
+    #         # 先不支持 Spec-Decode 的级联，在这条后端回退 dense
+    #         return False
+    #     if (
+    #         infllm2_stage1_select_blocks is None
+    #         or infllm2_build_kv_indices_from_ranges is None
+    #     ):
+    #         return False
+    #     return True
+
+    def _should_use_infllm2(self, layer, forward_batch, mode: str) -> bool:
         if not self.enable_infllmv2:
             return False
-        if layer.attn_type == AttentionType.ENCODER_ONLY:  # cross-attn 暂不走稀疏
+        if mode != "decode":  # ⬅️ 关键：只在 decode 用稀疏
             return False
-        if (
-            forward_batch.spec_info is not None
-            and self.num_draft_tokens
-            and self.num_draft_tokens > 0
-        ):
-            # 先不支持 Spec-Decode 的级联，在这条后端回退 dense
+        if layer.attn_type == AttentionType.ENCODER_ONLY:
+            return False
+        spec = forward_batch.spec_info
+        if spec is not None and self.num_draft_tokens and self.num_draft_tokens > 0:
             return False
         if (
             infllm2_stage1_select_blocks is None
@@ -1147,7 +1170,7 @@ class TritonAttnBackend(AttentionBackend):
                     self.forward_metadata.mask_indptr,
                     self.forward_metadata.max_extend_len,
                     layer.scaling,
-                    logit_cap=logits_soft_cap,
+                    logit_capping_mod(layer.logit_capping_method, layer.logit_cap),
                     sliding_window_size=-1,
                     sinks=sinks,
                     window_kv_offsets=None,
@@ -1156,12 +1179,23 @@ class TritonAttnBackend(AttentionBackend):
             return o
 
         # === 非捕获期：InfLLM-v2 ===
+        _LOG = int(os.getenv("SGLANG_LOG_INFLLM2", "0"))
+        if _LOG:
+            t0 = _evt()
+            t1 = _evt()
+            t2 = _evt()
+            t3 = _evt()
+            t4 = _evt()
+            t41 = _evt()
+            t5 = _evt()
+            stream = torch.cuda.current_stream()
+            t0.record(stream)
 
-        # 1) 逐样本拿“完整历史”的 token 索引 -> 直接从 req_to_token 切片（不写旧 kv_indices 缓冲）
+        # 1) 逐样本拿“完整历史”的 token 索引
         seq_lens = forward_batch.seq_lens  # [B]
         req_row = forward_batch.req_pool_indices.to(torch.int64)
 
-        # 2) C1/C2/offs（由 ctx_mgr 维护；要求不返回 None）
+        # 2) C1/C2/offs（由 ctx_mgr 维护）
         c1_list, c2_list, offs_list = [], [], []
         sc1_lens, sc2_lens = [], []
         req_id = getattr(forward_batch, "request_ids", None)
@@ -1169,26 +1203,36 @@ class TritonAttnBackend(AttentionBackend):
         for b in range(bs):
             rid = int(req_row[b].item())
             S = int(seq_lens[b].item())
+            rid_str = str(req_id[b]) if req_id is not None else f"req_{rid}"
+            key_tag = (rid_str, int(layer.layer_id))
 
-            if S > 0:
-                idx = self.req_to_token[rid, :S].to(torch.int64)
-                # Page/SWA 映射（若启用）
+            S_prev = self._infllm2_seen_len.get(key_tag, 0)
+            S_prev = min(S_prev, S)  # 防御（上下游重置/截断时不会越界）
+
+            # 只取“新增”的 [S_prev:S]
+            if S > S_prev:
+                idx_new = self.req_to_token[rid, S_prev:S].to(torch.int64)
                 if hasattr(
                     self.token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"
                 ):
-                    idx = (
+                    idx_new = (
                         self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                            idx
+                            idx_new
                         )
                     )
-                K_seq = key_pool.index_select(0, idx)  # [S,Hk,D]
+                K_new = key_pool.index_select(0, idx_new)  # [ΔS, Hk, D]
             else:
-                K_seq = key_pool[:0]  # 空视图
+                # 用一个 0 长度的张量表达“这步没有新 token”
+                K_new = key_pool[:0]
 
-            rid_str = str(req_id[b]) if req_id is not None else f"req_{rid}"
+            # 让 ctx_mgr 只用 K_new 做增量更新（不必重扫历史）
             c1, c2, offs, L1, L2 = ensure_c1c2_for_sample(
-                self.infllm2_ctx_mgr, rid_str, layer.layer_id, K_seq=K_seq
+                self.infllm2_ctx_mgr, rid_str, layer.layer_id, K_seq=K_new
             )
+
+            # 更新“已处理长度”
+            self._infllm2_seen_len[key_tag] = S
+
             assert (
                 (c1 is not None) and (c2 is not None) and (offs is not None)
             ), "ensure_c1c2_for_sample must not return None"
@@ -1198,11 +1242,13 @@ class TritonAttnBackend(AttentionBackend):
             offs_list.append(offs)
             sc1_lens.append(int(L1))
             sc2_lens.append(int(L2))
+            if _LOG:
+                t1.record(torch.cuda.current_stream())
 
         # 2.5) 右侧 pad & cat（不在捕获期，安全）
         L1_max = max(1, max(sc1_lens) if sc1_lens else 1)
         L2_max = max(1, max(sc2_lens) if sc2_lens else 1)
-        nmax = max(o.shape[-1] for o in offs_list) if offs_list else 2
+        nmax = max(x.shape[-1] for x in offs_list) if offs_list else 2
 
         def _pad_blocks(x, L_max):
             if x.shape[2] == L_max:
@@ -1216,157 +1262,341 @@ class TritonAttnBackend(AttentionBackend):
             return torch.cat([o, last.repeat(1, 1, n_max - o.shape[-1])], dim=-1)
 
         c1 = torch.cat([_pad_blocks(t, L1_max) for t in c1_list], dim=0)  # [B,Hk,L1,D]
-        c2 = torch.cat([_pad_blocks(t, L2_max) for t in c2_list], dim=0)  # [B,Hk,L2,D]
         offs = torch.cat([_pad_offs(o, nmax) for o in offs_list], dim=0)  # [B,1,n]
+        c2 = None  # ← stage-1 不需要
         sc1_len = torch.tensor(sc1_lens, device=device, dtype=torch.int32)  # [B]
+        if _LOG:
+            t2.record(torch.cuda.current_stream())
 
-        # 3) Stage-1 Top-K（多 token 段聚合 + GQA 聚合）
-        Hq, Dq = layer.tp_q_head_num, layer.qk_head_dim
-        Hk = layer.tp_k_head_num
-        q_tok_hqd = q.view(-1, Hq, Dq)
-        qo = getattr(self.forward_metadata, "qo_indptr", None)
+        # 统一 indptr 引用（两条路径都会用）
+        kv_indptr_out = self.forward_metadata.kv_indptr
 
-        if qo is None:
-            assert (
-                q_tok_hqd.shape[0] == bs
-            ), "decode path expects T==B when no qo_indptr"
-            q_seg_bhd = q_tok_hqd
+        # —— 打印形状（便于对齐你现有日志）——
+        if _LOG:
+            Hq = layer.tp_q_head_num
+            Hk_eff = int(key_pool.shape[1])
+            log = [
+                "[infllm2][shape] bs=",
+                bs,
+                " q_hkd=",
+                (bs, Hk_eff, layer.qk_head_dim),
+                " c1=",
+                tuple(c1.shape),
+                " valid=",
+                (bs, Hk_eff),
+                " Hq=",
+                Hq,
+                " Hk_eff=",
+                Hk_eff,
+                " layer.Hk=",
+                layer.tp_k_head_num,
+            ]
+            print(*log)
+
+        # 4) fastpath：当 L1 极小（<=1）时，直接走 SW/sink 窗口
+        L1_is_tiny = int(c1.shape[2]) <= 1
+        if L1_is_tiny:
+            if _LOG:
+                t3.record(
+                    torch.cuda.current_stream()
+                )  # fastpath 下 topk=0，占个位防止 elapsed_time 报错
+            # 选择窗口：优先 sw_span，再次 sink_tokens；最终上限用 env，可调 SGLANG_INFLLM2_SW_FAST_CAP（默认 128）
+            W_cap = int(os.getenv("SGLANG_INFLLM2_SW_FAST_CAP", "512"))
+            W_cfg = (
+                int(self.infllm2_sw_span)
+                if int(self.infllm2_sw_span) > 0
+                else int(self.infllm2_sink_tokens)
+            )
+            if W_cfg <= 0:
+                W_cfg = 64
+            W = min(W_cfg, W_cap)
+
+            # === 向量化一次性生成每个样本的一段 [S-W, S) ===
+            S = seq_lens.to(dtype=torch.int32, device=device)  # [B]
+            s = torch.clamp(S - W, min=0)  # [B]
+            lens = (S - s).to(torch.int32)  # [B]
+
+            # kv_indptr: 前缀和
+            kv_indptr_out[0] = 0
+            if bs > 0:
+                torch.cumsum(lens, dim=0, out=kv_indptr_out[1 : bs + 1])  # [B+1]
+            tok_total = int(kv_indptr_out[bs].item())
+
+            # range_indptr 就是 [0,1,2,...,B]
+            range_indptr = torch.arange(0, bs + 1, device=device, dtype=torch.int32)
+            range_starts = s  # [B]
+            range_lens = lens  # [B]
+
+            # r2i：把小的临时 range 元数据直接喂给 kernel
+            from sglang.srt.layers.attention.triton_ops.infllmv2 import (
+                _ranges_to_indices_kernel,
+            )
+
+            if _LOG:
+                t4.record(torch.cuda.current_stream())
+
+            req = self.req_to_token
+            if tok_total > 0:
+                self._ensure_kv_indices_capacity(tok_total)
+                _ranges_to_indices_kernel[(bs,)](
+                    req,
+                    req.stride(0),
+                    req.stride(1),
+                    forward_batch.req_pool_indices.to(
+                        dtype=torch.int32, device=req.device
+                    ),
+                    range_indptr,
+                    range_starts,
+                    range_lens,
+                    kv_indptr_out,
+                    self.cuda_graph_kv_indices,
+                    pool_w=req.shape[1],
+                    BLOCK=128,
+                )
+
+            if _LOG:
+                t41.record(torch.cuda.current_stream())
+                print(f"[infllm2][fastpath] sw W={W}, tok_total={tok_total}")
+
         else:
-            qo = qo[: bs + 1]
-            chunks = []
-            T = q_tok_hqd.shape[0]
-            for b in range(bs):
-                s = int(qo[b].item())
-                e = int(qo[b + 1].item())
-                if e <= s:
-                    chunks.append(
-                        torch.zeros((1, Hq, Dq), device=q.device, dtype=q.dtype)
+            # —— 只有非 fastpath 才做 GQA / Stage-1 / ranges 合并 ——
+            Hq, Dq = layer.tp_q_head_num, layer.qk_head_dim
+
+            # 以 KV 池为准，得到“有效的”KV头数
+            Hk_eff = int(key_pool.shape[1])
+
+            q_tok_hqd = q.view(-1, Hq, Dq)
+            qo = getattr(self.forward_metadata, "qo_indptr", None)
+
+            if qo is None:
+                assert (
+                    q_tok_hqd.shape[0] == bs
+                ), "decode path expects T==B when no qo_indptr"
+                q_seg_bhd = q_tok_hqd
+            else:
+                qo = qo[: bs + 1]
+                chunks = []
+                T = q_tok_hqd.shape[0]
+                for b in range(bs):
+                    s0 = int(qo[b].item())
+                    e0 = int(qo[b + 1].item())
+                    if e0 <= s0:
+                        chunks.append(
+                            torch.zeros((1, Hq, Dq), device=q.device, dtype=q.dtype)
+                        )
+                    else:
+                        s0 = max(0, min(s0, T))
+                        e0 = max(0, min(e0, T))
+                        chunks.append(q_tok_hqd[s0:e0].sum(dim=0, keepdim=True))
+                q_seg_bhd = torch.cat(chunks, dim=0)  # [B, Hq, D]
+
+            # GQA：Hq -> Hk_eff
+            assert Hq % Hk_eff == 0, f"GQA head mismatch: Hq={Hq}, Hk_eff={Hk_eff}"
+            group = Hq // Hk_eff
+            q_hkd = (
+                q_seg_bhd.view(bs, Hk_eff, group, Dq).mean(dim=2).contiguous()
+            )  # [B, Hk_eff, D]
+
+            # c1/c2 形状自检 + 必要时从 Hq 聚合到 Hk_eff
+            if c1.shape[0] != bs:
+                raise RuntimeError(
+                    f"[infllm2] batch mismatch: c1[0]={c1.shape[0]} vs bs={bs}"
+                )
+            if c1.shape[1] != Hk_eff:
+                if c1.shape[1] % Hk_eff == 0:
+                    g2 = c1.shape[1] // Hk_eff
+                    c1 = (
+                        c1.view(bs, Hk_eff, g2, c1.shape[2], c1.shape[3])
+                        .mean(dim=2)
+                        .contiguous()
+                    )
+                    c2 = (
+                        c2.view(bs, Hk_eff, g2, c2.shape[2], c2.shape[3])
+                        .mean(dim=2)
+                        .contiguous()
                     )
                 else:
-                    s = max(0, min(s, T))
-                    e = max(0, min(e, T))
-                    chunks.append(q_tok_hqd[s:e].sum(dim=0, keepdim=True))
-            q_seg_bhd = torch.cat(chunks, dim=0)
+                    raise RuntimeError(
+                        f"[infllm2] head mismatch: c1[1]={c1.shape[1]}, Hk_eff={Hk_eff}, "
+                        f"Hq={Hq}, layer.tp_k_head_num={layer.tp_k_head_num}"
+                    )
 
-        assert Hq % Hk == 0, f"GQA mismatch: Hq={Hq}, Hk={Hk}"
-        group = Hq // Hk
-        q_hkd = q_seg_bhd.view(bs, Hk, group, Dq).mean(dim=2)  # [B,Hk,D]
-        valid_sc1_bh = sc1_len.view(-1, 1).expand(-1, c1.shape[1]).contiguous()
+            valid_sc1_bh = (
+                sc1_len.view(-1, 1).expand(-1, c1.shape[1]).contiguous()
+            )  # [B, Hk_eff]
 
-        fn_stage1 = globals().get("infllm2_stage1_select_blocks_triton", None)
-        if callable(fn_stage1):
-            topk_idx = fn_stage1(
-                q_hkd,
-                c1,
-                valid_sc1_bh,
-                softmax_scale=layer.scaling,
-                topk=self.infllm2_topk_blocks,
+            # —— 调用 Stage-1 ——
+            fn_stage1 = globals().get("infllm2_stage1_select_blocks_triton", None)
+            if fn_stage1:
+                topk_idx = fn_stage1(
+                    q_hkd,  # [B, Hk_eff, D]
+                    c1,  # [B, Hk_eff, L1, D]
+                    valid_sc1_bh,  # [B, Hk_eff]
+                    softmax_scale=layer.scaling,
+                    topk=self.infllm2_topk_blocks,
+                )
+            else:
+                topk_idx = infllm2_stage1_select_blocks(
+                    q_hkd,
+                    c1,
+                    None,
+                    offs,
+                    valid_sc1_bh,
+                    topk=self.infllm2_topk_blocks,
+                    softmax_scale=layer.scaling,
+                )
+
+            # 归一化 topk 索引，避免越界
+            def _norm_topk_idx(topk_idx_, sc1_len_vec):
+                if topk_idx_.dim() == 3:  # [B,Hk,K]
+                    max_idx = torch.clamp(sc1_len_vec.unsqueeze(-1) - 1, min=0)
+                    return torch.minimum(torch.clamp_min(topk_idx_, 0), max_idx)
+                else:  # [B,Sq,Hk,K]
+                    max_idx = torch.clamp(
+                        sc1_len_vec.unsqueeze(1).unsqueeze(-1) - 1, min=0
+                    )
+                    topk_idx_ = torch.clamp_min(topk_idx_, 0)
+                    return torch.minimum(topk_idx_, max_idx)
+
+            topk_idx = _norm_topk_idx(topk_idx, valid_sc1_bh)
+            if _LOG:
+                t3.record(torch.cuda.current_stream())
+
+            # 块 -> 样本级 token 区间（并 ∪ sink / sliding window）
+            if topk_idx.dim() == 3:
+                topk_idx_bshk = topk_idx.unsqueeze(1)  # [B,1,Hk,K]
+            else:
+                topk_idx_bshk = topk_idx  # [B,Sq,Hk,K]
+
+            offs_bhn = (
+                offs.view(bs, 1, -1).expand(bs, c1.shape[1], -1).contiguous()
+            )  # [B,Hk,n+1]
+            ranges = blocks_to_token_ranges(
+                topk_idx_bshk=topk_idx_bshk,
+                c1_block_offsets_bhk=offs_bhn,
+                block_size=self.infllm2_cfg.block_size,
+                sink_len=int(self.infllm2_sink_tokens),
+                sw_span=int(self.infllm2_sw_span),
+                Sk_vis=int(seq_lens.max().item()),
             )
-        else:
-            topk_idx = infllm2_stage1_select_blocks(
-                q_hkd,
-                c1,
-                None,
-                offs,
-                valid_sc1_bh,
-                topk=self.infllm2_topk_blocks,
-                softmax_scale=layer.scaling,
-            )  # [B,Hk,K]
+            if _LOG >= 2:
+                # 检查 offsets 是否单调
+                with torch.no_grad():
+                    bad = 0
+                    for b in range(bs):
+                        o = offs[b, 0]  # [n+1]
+                        if not bool(torch.all(o[1:] >= o[:-1])):
+                            bad += 1
+                    if bad > 0:
+                        print(
+                            f"[infllm2][debug] non-monotonic offs in {bad}/{bs} samples"
+                        )
 
-        # 4) 块 -> 样本级 token 区间（并 ∪ sink / sliding window）
-        if topk_idx.dim() == 3:
-            topk_idx_bshk = topk_idx.unsqueeze(1)  # [B,1,Hk,K]
-        else:
-            topk_idx_bshk = topk_idx  # [B,Sq,Hk,K]
+            # --- 5) ranges → 稀疏 kv_indices/kv_indptr（写入预分配 workspace，紧凑布局）---
+            K = int(self.infllm2_topk_blocks)
+            sw_extra = 2
+            Rneed = max(4, K + sw_extra)
+            Rcap = min(int(getattr(self, "infllm2_R_cap", 128)), Rneed)
+            self._ensure_infllm2_workspace(bs, Rcap)
 
-        offs_bhn = (
-            offs.view(bs, 1, -1).expand(bs, c1.shape[1], -1).contiguous()
-        )  # [B,Hk,n+1]
-        ranges = blocks_to_token_ranges(
-            topk_idx_bshk=topk_idx_bshk,
-            c1_block_offsets_bhk=offs_bhn,
-            block_size=self.infllm2_cfg.block_size,
-            sink_len=int(self.infllm2_sink_tokens),
-            sw_span=int(self.infllm2_sw_span),
-            Sk_vis=int(seq_lens.max().item()),
-        )
+            # 只清需要用到的前缀
+            self.infllm2_range_indptr[: bs + 1].zero_()
+            kv_indptr_out[: bs + 1].zero_()
 
-        # --- 5) ranges → 稀疏 kv_indices/kv_indptr（全部写入预分配 workspace）---
-        Rcap = getattr(
-            self, "infllm2_R_cap", 96
-        )  # 建议从 64 提到 96/128，减少被截断概率
-        # 确保 workspace 容量足够当前 bs
-        self._ensure_infllm2_workspace(bs, Rcap)
+            max_ranges = bs * Rcap
+            r_ptr = 0
+            tok_total = 0
+            for b in range(bs):
+                self.infllm2_range_indptr[b] = r_ptr
+                wrote_in_b = 0
+                for s1, e1 in _iter_segments_safe(ranges[b]):
+                    if wrote_in_b >= Rcap or r_ptr >= max_ranges:
+                        break
+                    n = e1 - s1
+                    if n <= 0:
+                        continue
+                    self.infllm2_range_starts[r_ptr] = int(s1)
+                    self.infllm2_range_lens[r_ptr] = int(n)
+                    r_ptr += 1
+                    wrote_in_b += 1
+                    tok_total += n
+                kv_indptr_out[b + 1] = tok_total
+            self.infllm2_range_indptr[bs] = r_ptr
 
-        # 清零头部（不会重新分配）
-        self.infllm2_range_indptr[: bs + 1].zero_()
-        # 注：starts/lens 只清本批次可能写到的片段前缀；全清也可
-        self.infllm2_range_starts[: bs * Rcap].zero_()
-        self.infllm2_range_lens[: bs * Rcap].zero_()
+            if tok_total == 0:
+                if _LOG >= 2:
+                    print(
+                        "[infllm2][debug] empty ranges fallback;"
+                        f" L1_max={int(c1.shape[2])} K={int(self.infllm2_topk_blocks)} "
+                        f"sw_span={int(self.infllm2_sw_span)} sink={int(self.infllm2_sink_tokens)}"
+                    )
+                # 保底 fallback：取一个小 SW 窗口
+                W = (
+                    int(self.infllm2_sw_span)
+                    if int(self.infllm2_sw_span) > 0
+                    else int(self.infllm2_sink_tokens)
+                )
+                if W <= 0:
+                    W = 16
+                W_cap = int(os.getenv("SGLANG_INFLLM2_SW_FAST_CAP", "512"))
+                W = min(W, W_cap)
+                r_ptr = 0
+                tok_total = 0
+                self.infllm2_range_indptr[: bs + 1].zero_()
+                kv_indptr_out[: bs + 1].zero_()
+                for b in range(bs):
+                    S = int(seq_lens[b].item())
+                    s1 = max(0, S - W)
+                    e1 = S
+                    if e1 > s1:
+                        self.infllm2_range_indptr[b] = r_ptr
+                        self.infllm2_range_starts[r_ptr] = s1
+                        self.infllm2_range_lens[r_ptr] = e1 - s1
+                        r_ptr += 1
+                        tok_total += e1 - s1
+                    kv_indptr_out[b + 1] = tok_total
+                self.infllm2_range_indptr[bs] = r_ptr
+                if _LOG:
+                    print(
+                        f"[infllm2][fallback] used SW/sink window W={W}, tok_total={int(tok_total)}"
+                    )
 
-        kv_indptr_out = self.forward_metadata.kv_indptr
-        kv_indptr_out[: bs + 1].zero_()
+            # Triton kernel：把 ranges 映射为 token indices，直接写大缓冲的前 tok_total 段
+            from sglang.srt.layers.attention.triton_ops.infllmv2 import (
+                _ranges_to_indices_kernel,
+            )
 
-        tok_total = 0
-        r_ptr = 0
-        for b in range(bs):
-            # ★ 这里不会越界了，因为 indptr 的长度是 (bs_cap+1) 并且 >= bs+1
-            self.infllm2_range_indptr[b] = r_ptr
-            wrote = 0
-            for s, e in _iter_segments_safe(ranges[b]):
-                n = e - s
-                if n <= 0:
-                    continue
-                # 每个样本最多写 Rcap 段，防止越界
-                if wrote >= Rcap:
-                    # 这里可以记录一次水位告警（可选）
-                    break
-                self.infllm2_range_starts[b * Rcap + wrote] = int(s)
-                self.infllm2_range_lens[b * Rcap + wrote] = int(n)
-                r_ptr += 1
-                wrote += 1
-                tok_total += n
-            kv_indptr_out[b + 1] = tok_total
-        self.infllm2_range_indptr[bs] = r_ptr
+            if _LOG:
+                t4.record(torch.cuda.current_stream())
 
-        # 确保 kv_indices 大缓冲容量足够 tok_total
-        self._ensure_kv_indices_capacity(tok_total)
-
-        # Triton kernel：把 ranges 映射为 token indices，直接写大缓冲的前 tok_total 段
-        from sglang.srt.layers.attention.triton_ops.infllmv2 import (
-            _ranges_to_indices_kernel,
-        )
-
-        req = self.req_to_token
-        _ranges_to_indices_kernel[(bs,)](
-            req,
-            req.stride(0),
-            req.stride(1),
-            forward_batch.req_pool_indices.to(dtype=torch.int32, device=req.device),
-            self.infllm2_range_indptr,  # [bs+1]
-            self.infllm2_range_starts,  # [bs*Rcap]
-            self.infllm2_range_lens,  # [bs*Rcap]
-            kv_indptr_out,  # [bs+1]
-            self.cuda_graph_kv_indices,  # 目标缓冲（容量已保证）
-            pool_w=req.shape[1],
-            BLOCK=128,
-        )
+            req = self.req_to_token
+            self._ensure_kv_indices_capacity(tok_total)
+            _ranges_to_indices_kernel[(bs,)](
+                req,
+                req.stride(0),
+                req.stride(1),
+                forward_batch.req_pool_indices.to(dtype=torch.int32, device=req.device),
+                self.infllm2_range_indptr,  # [bs+1]
+                self.infllm2_range_starts,  # [r_ptr] 有效前缀
+                self.infllm2_range_lens,  # [r_ptr] 有效前缀
+                kv_indptr_out,  # [bs+1]
+                self.cuda_graph_kv_indices,  # 目标 token 索引大缓冲
+                pool_w=req.shape[1],
+                BLOCK=128,
+            )
+            if _LOG:
+                t41.record(torch.cuda.current_stream())
 
         # ---------- 只在 decode 需要 num_kv_splits ----------
         num_kv_splits_local = None
         if mode == "decode":
-            # 稀疏长度 -> splits
             seq_lens_sparse = (kv_indptr_out[1:] - kv_indptr_out[:-1]).to(torch.int32)
-
-            # 优先复用 forward_metadata 的 buffer；没有就临时分配一个（非捕获期安全）
             num_kv_splits_local = self.forward_metadata.num_kv_splits
             if (num_kv_splits_local is None) or (num_kv_splits_local.numel() < bs):
                 num_kv_splits_local = torch.empty(
                     (bs,), dtype=torch.int32, device=device
                 )
-
             self.get_num_kv_splits(num_kv_splits_local[:bs], seq_lens_sparse[:bs])
-        # -----------------------------------------------
 
         # 统一使用我们刚写好的稀疏 indptr/indices
         kv_indptr = kv_indptr_out
@@ -1380,7 +1610,6 @@ class TritonAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         if mode == "decode":
-            # 必须把 num_kv_splits_local 传给 decode kernel
             self.decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 key_pool,
@@ -1390,7 +1619,7 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indices,
                 self.forward_metadata.attn_logits,
                 self.forward_metadata.attn_lse,
-                num_kv_splits_local,  # <<< 这里用 local
+                num_kv_splits_local,
                 self.max_kv_splits,
                 layer.scaling,
                 logit_cap=logits_soft_cap,
@@ -1398,7 +1627,6 @@ class TritonAttnBackend(AttentionBackend):
                 xai_temperature_len=layer.xai_temperature_len,
             )
         else:
-            # extend 路径不需要 num_kv_splits
             causal = layer.attn_type != AttentionType.ENCODER_ONLY
             self.extend_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1421,6 +1649,26 @@ class TritonAttnBackend(AttentionBackend):
                 window_kv_offsets=None,
                 xai_temperature_len=layer.xai_temperature_len,
             )
+
+        if _LOG:
+            t5.record(torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            print(
+                "[infllm2][ms]",
+                "ΔK+C1C2:",
+                t0.elapsed_time(t1),
+                "pad&cat:",
+                t1.elapsed_time(t2),
+                "topk:",
+                t2.elapsed_time(t3),
+                "prep:",
+                t3.elapsed_time(t4),
+                "r2i:",
+                t4.elapsed_time(t41),
+                "kernel:",
+                t41.elapsed_time(t5),
+            )
+
         return o
 
 

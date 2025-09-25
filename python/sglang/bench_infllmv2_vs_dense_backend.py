@@ -75,8 +75,8 @@ def main():
     ap.add_argument("--num-prompts", type=int, default=1000)
     ap.add_argument("--sharegpt-output-len", type=int, default=None)
     ap.add_argument("--sharegpt-context-len", type=int, default=None)
-    ap.add_argument("--random-input-len", type=int, default=1024)
-    ap.add_argument("--random-output-len", type=int, default=1024)
+    ap.add_argument("--random-input-len", type=int, default=16384)
+    ap.add_argument("--random-output-len", type=int, default=2048)
     ap.add_argument("--random-range-ratio", type=float, default=0.5)
     ap.add_argument("--request-rate", type=float, default=float("inf"))
     ap.add_argument("--max-concurrency", type=int, default=64)
@@ -149,7 +149,7 @@ def main():
         )
 
     # print("\n====== DENSE run ======")
-    # dense_res: Dict[str, Any] = _run_one(dense_ns)
+    dense_res: Dict[str, Any] = _run_one(dense_ns)
 
     print("\n====== SPARSE run ======")
     sparse_res: Dict[str, Any] = _run_one(sparse_ns)
@@ -157,45 +157,47 @@ def main():
     rows = (
         (
             "Request throughput (req/s)",
-            # dense_res.get("request_throughput"),
+            dense_res.get("request_throughput"),
             sparse_res.get("request_throughput"),
         ),
         (
             "Input tok/s",
-            # dense_res.get("input_throughput"),
+            dense_res.get("input_throughput"),
             sparse_res.get("input_throughput"),
         ),
         (
             "Output tok/s",
-            # dense_res.get("output_throughput"),
+            dense_res.get("output_throughput"),
             sparse_res.get("output_throughput"),
         ),
         (
             "Total tok/s",
-            # dense_res.get("total_throughput"),
+            dense_res.get("total_throughput"),
             sparse_res.get("total_throughput"),
         ),
         (
             "Mean TTFT (ms)",
-            # dense_res.get("mean_ttft_ms"),
+            dense_res.get("mean_ttft_ms"),
             sparse_res.get("mean_ttft_ms"),
         ),
-        # ("P99 TTFT (ms)", dense_res.get("p99_ttft_ms"), sparse_res.get("p99_ttft_ms")),
-        # ("Mean ITL (ms)", dense_res.get("mean_itl_ms"), sparse_res.get("mean_itl_ms")),
-        # ("P95 ITL (ms)", dense_res.get("p95_itl_ms"), sparse_res.get("p95_itl_ms")),
-        ("P99 TTFT (ms)", sparse_res.get("p99_ttft_ms")),
-        ("Mean ITL (ms)", sparse_res.get("mean_itl_ms")),
-        ("P95 ITL (ms)", sparse_res.get("p95_itl_ms")),
+        ("P99 TTFT (ms)", dense_res.get("p99_ttft_ms"), sparse_res.get("p99_ttft_ms")),
+        ("Mean ITL (ms)", dense_res.get("mean_itl_ms"), sparse_res.get("mean_itl_ms")),
+        ("P95 ITL (ms)", dense_res.get("p95_itl_ms"), sparse_res.get("p95_itl_ms")),
+        # ("P99 TTFT (ms)", sparse_res.get("p99_ttft_ms")),
+        # ("Mean ITL (ms)", sparse_res.get("mean_itl_ms")),
+        # ("P95 ITL (ms)", sparse_res.get("p95_itl_ms")),
         (
             "Mean E2E Latency (ms)",
-            # dense_res.get("mean_e2e_latency_ms"),
+            dense_res.get("mean_e2e_latency_ms"),
             sparse_res.get("mean_e2e_latency_ms"),
         ),
-        # ("Concurrency", dense_res.get("concurrency"), sparse_res.get("concurrency")),
-        # ("Completed requests", dense_res.get("completed"), sparse_res.get("completed")),
+        ("Concurrency", dense_res.get("concurrency"), sparse_res.get("concurrency")),
+        ("Completed requests", dense_res.get("completed"), sparse_res.get("completed")),
+        # ("Concurrency", sparse_res.get("concurrency")),
+        # ("Completed requests", sparse_res.get("completed")),
         (
             "Total output tokens",
-            # dense_res.get("total_output_tokens"),
+            dense_res.get("total_output_tokens"),
             sparse_res.get("total_output_tokens"),
         ),
     )
@@ -203,7 +205,7 @@ def main():
 
     if args.save_json:
         payload = {
-            # "dense": dense_res,
+            "dense": dense_res,
             "sparse": sparse_res,
             "compare": {n: {"dense": dv, "sparse": sv} for (n, dv, sv) in rows},
         }
